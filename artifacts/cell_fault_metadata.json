@@ -1,0 +1,12 @@
+{
+  "model": "cell_fault_detector",
+  "task": "concurrent silent-fault detection",
+  "val_prauc": 0.0435724508997086,
+  "test_prauc": 0.03383981384772469,
+  "val_base_rate": 0.0013289907157831686,
+  "threshold": 0.08136273175477982,
+  "train_rows": 236115,
+  "val_rows": 53424,
+  "test_rows": 53265,
+  "note": "Sanitized: availability_mean and region features excluded (tautological / low-sample shortcuts)."
+}

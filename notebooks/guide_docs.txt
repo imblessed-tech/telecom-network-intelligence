@@ -1,0 +1,1796 @@
+Build Guide — Telecom Network Intelligence Project (VS Code, start to finish)
+This is the consolidated reference. Every function named below was already written and validated earlier in this project's chat history — this guide's job is to tell you exactly which file each one goes into and the order to build and test things in, so you're assembling a known-working system rather than guessing. Where a file is brand-new (not written before), full code is included.
+
+Work through this phase by phase, testing after each phase — don't write all the files first and test at the end. Every earlier bug in this project (stale tables, mismatched joins, silent row-count changes) was caught specifically because each layer was validated before the next was built on top of it. Same discipline applies here.
+
+Phase 0 — Scaffolding
+Open a terminal in VS Code and run:
+
+mkdir telecom-network-intelligence && cd telecom-network-intelligence
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+
+mkdir -p simulator ml_pipeline artifacts api/routers api/core scripts notebooks tests
+mkdir -p data/raw data/hourly data/ml
+
+touch simulator/__init__.py ml_pipeline/__init__.py api/__init__.py api/routers/__init__.py
+touch simulator/topology.py simulator/capacity.py simulator/operational.py
+touch ml_pipeline/config.py ml_pipeline/features.py ml_pipeline/labels.py ml_pipeline/train.py
+touch api/main.py api/dependencies.py api/schemas.py
+touch api/routers/health.py api/routers/fault_detection.py api/routers/congestion.py api/routers/anomaly.py
+touch scripts/run_full_pipeline.py
+touch requirements.txt render.yaml .gitignore README.md
+
+git init
+Create requirements.txt and install:
+
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+pandas==2.2.2
+numpy==1.26.4
+scipy==1.13.0
+scikit-learn==1.5.0
+xgboost==2.0.3
+shap==0.45.1
+joblib==1.4.2
+pydantic==2.7.1
+pyarrow==16.1.0
+networkx==3.3
+k-means-constrained==0.7.3
+pip install -r requirements.txt
+Create .gitignore:
+
+data/
+__pycache__/
+*.pyc
+.env
+venv/
+Phase 1 — simulator/topology.py
+Purpose: all static network generation — regions, sites, cells, aggregation nodes, transport mesh, core nodes, and the unified topology table.
+
+Function inventory — search the chat for these exact names and paste them in, in this order:
+
+Order	Function	What it does
+1	factor_lookup	Converts qualitative region factors to numeric scores
+2	create_regions	Builds the regions table
+3	create_sites	Allocates sites to regions
+4	assign_site_coordinates	Lat/lon via region anchors + spread (use the widened REGION_ANCHORS/REGION_SPREAD_DEG from the geography-fix round, not the original narrow ones)
+5	assign_site_type	urban/suburban/rural classification
+6	create_cells	Cell generation per site
+7	assign_sector_and_band	Sector cycling + band assignment
+8	assign_baseline_heterogeneity	Per-cell quality offset + Watch-band override (from the heterogeneity round)
+9	assign_cell_capacity	cell_capacity_mbps from (technology, band)
+10	haversine_km	Distance helper — used everywhere below
+11	assign_aggregation_nodes + create_aggregation_nodes	K-means-constrained clustering
+12	add_region_demand_multiplier + compute_design_load	Demand derivation (the corrected version with demand_variation_factor/watch_utilization_override folded in)
+13	assign_aggregation_capacity	Aggregation capacity sizing
+14	build_backhaul_links	Site→aggregation links (the version with headroom_factor=1.5, min_capacity_gbps floor)
+15	build_transport_mesh	Kruskal MST + redundancy augmentation
+16	classify_medium + size_transport_mesh	Mesh link sizing from failover routing (the routed-load version using compute_mesh_failover_load, not the early heuristic)
+17	compute_mesh_failover_load	Shortest-path failover load calculation
+18	create_core_nodes	Core node placement (off-anchor coordinates)
+19	assign_core_dependencies	Primary/secondary core assignment
+20	assign_core_capacity	Core capacity from primary+secondary load
+21	build_transport_links_table + build_topology_table	Final unified tables
+22	validate_topology	Connectivity/failover sanity checks
+Constants to paste at the top of the file: NETWORK_CONFIG, REGION_INFO, REGION_ANCHORS (widened version), REGION_SPREAD_DEG (widened version), CORE_ANCHORS.
+
+Test before moving on:
+
+# in a scratch cell or tests/test_topology_smoke.py
+import numpy as np
+rng = np.random.default_rng(42)
+regions = create_regions(REGION_INFO, 50)
+sites = create_sites(regions)
+sites = assign_site_coordinates(sites, regions, rng=rng)
+sites = assign_site_type(sites, regions)
+cells = create_cells(regions, sites, rng)
+cells = assign_sector_and_band(cells, rng)
+cells = assign_baseline_heterogeneity(cells, rng)
+cells = assign_cell_capacity(cells)
+assert len(sites) == 50 and cells.cell_id.is_unique
+print("Phase 1 topology OK:", sites.shape, cells.shape)
+Phase 2 — simulator/capacity.py
+Function inventory:
+
+Function	Notes
+audit_capacity_chain	The full-chain utilization audit — run after every regeneration
+_flag_outliers	Helper used inside the audit
+Test: run audit_capacity_chain(...) on Phase 1's output and confirm aggregation utilization lands ~70-75%, no undercapacity beyond the one known thin microwave link, no core LOW/HIGH flags beyond what was previously explained (core provisioned for failover).
+
+Phase 3 — simulator/operational.py
+Purpose: 90 days of telemetry, faults, alarms, anomalies, congestion.
+
+Constants: TIME_CONFIG, N_STEPS, SEVERITY_LEVELS, SEVERITY_WEIGHTS, FAULT_TYPE_CONFIG, LINK_PROFILES, RADIO_BASELINE_SINR, MBPS_PER_ACTIVE_USER, ALARM_RULES, FALSE_ALARM_RATE, TRANSPORT_MEDIUM_PROFILES (if not already in topology.py).
+
+Function inventory, in build order:
+
+Order	Function	Notes
+1	build_time_index	90-day hourly/15-min index
+2	diurnal_curve	Region/site-type-shaped daily curve
+3	generate_traffic_demand	Cell-level demand
+4	inject_anomalies	Short demand spikes (hidden truth)
+5	generate_congestion_events + apply_congestion_to_demand	Use the retargeted version — sites pre-selected by design-time utilization band, not random
+6	build_neighbor_map	Nearest-cell lookup for handover
+7	generate_network_faults	Use the version with link_source_id/link_target_id split columns, not a tuple entity_id
+8	fault_intensity	Ramp-plateau-ramp shape
+9	resolve_fault_scope	Topology-driven fault scope — used everywhere downstream
+10	generate_ran_telemetry	Use the two-pass version (intrinsic quality pass, then handover pass using real neighbor SINR)
+11	compute_hierarchy_loads	Rolls cell traffic up to site/aggregation/core
+12	build_link_load_lookup + generate_link_telemetry + generate_transport_telemetry	Transport telemetry, all three link types
+13	generate_core_telemetry	Core telemetry
+14	generate_alarms	Use the hysteresis version (fire_with_hysteresis, breach/clear thresholds), not the plain persistence-only version
+15	fire_with_hysteresis	Hysteresis helper
+16	build_evaluation_labels	Cell-level fault label table (hidden truth)
+17	build_eval_fault_events, eval_congestion_events/eval_data_anomalies (direct copies)	Ground-truth tables for the anomaly evaluation harness
+Test: generate the full 90 days on the Phase 1/2 output, then run:
+
+audit_fault_magnitude(network_faults, ran_telemetry, transport_telemetry, core_telemetry,
+                       sites, cells, aggregations, core_deps_df, mesh_links)
+All 6 fault types should show correct-direction deltas, zero misses.
+
+Phase 4 — ml_pipeline/config.py, features.py, train.py
+These three files were given in full, ready to paste, in the previous message of this conversation (the one that produced the full FastAPI project). Copy them exactly as written there — no changes needed unless you want to adjust feature lists.
+
+Also add (referenced but not yet placed in a file): build_batch_cell_fault_features belongs in ml_pipeline/features.py (it's the batch/training-time counterpart to compute_live_cell_fault_features, both already in that file per the previous message).
+
+ml_pipeline/labels.py — paste build_fault_labels_for_cells here (written during the Use Case 1 detailed guide).
+
+Test:
+
+from ml_pipeline.features import build_batch_cell_fault_features
+ml_cell_fault_features = build_batch_cell_fault_features(ml_hourly_ran)
+print(ml_cell_fault_features.isna().sum().sort_values(ascending=False).head())
+Expect NaNs only in the first ~4 warm-up hours per cell.
+
+Phase 5 — scripts/run_full_pipeline.py
+Given in full in the previous message. Paste as-is, then fill in the two # (abbreviated here...) sections in run_ml_tables/run_training using the functions from Phase 4 plus train_cell_fault_model/train_congestion_models/build_anomaly_baselines from ml_pipeline/train.py.
+
+Run it:
+
+python -m scripts.run_full_pipeline
+This is the single command that takes a fresh clone to a fully populated artifacts/ folder. Expect this to take a while (telemetry generation is the slow stage) — that's why every stage checkpoints to data/ and skips on rerun unless --force is passed.
+
+Verify artifacts/ now contains:
+
+cell_fault_model.joblib
+shap_explainer_cell_fault.joblib
+cell_fault_schema.json
+cell_fault_metadata.json
+congestion_model_1h.joblib / _6h.joblib / _24h.joblib
+congestion_schema.json
+congestion_metadata.json
+anomaly_baselines.parquet
+Phase 6 — api/schemas.py, dependencies.py, main.py, routers/*
+All given in full in the previous message — paste exactly as written. This phase has no dependency on simulator/ at all; it only reads artifacts/.
+
+Test locally:
+
+uvicorn api.main:app --reload
+Open http://127.0.0.1:8000/docs — FastAPI's auto-generated Swagger UI. Test each endpoint there directly:
+
+GET /health — confirm status: ok and all artifact flags true.
+POST /predict/fault/cell — paste 5+ real hourly rows for one cell from data/hourly/ml_hourly_ran.parquet (pick any cell_id, its last 5-10 rows) as the request body.
+POST /predict/fault/cell/explain — same body, confirm top_contributions returns a sensible ranked list (SINR/BLER/PRB features should dominate, not hour_of_day).
+POST /predict/congestion?horizon=1h — needs a longer window (up to 336 hourly rows) for full accuracy, but will run with fewer (NaN-tolerant).
+POST /predict/anomaly — needs 1-3 recent values for one metric.
+If any of these 404s or 422s, check the request body against api/schemas.py's exact field names first — that's the most common mismatch.
+
+Phase 7 — Commit and deploy
+git add artifacts/ simulator/ ml_pipeline/ api/ scripts/ requirements.txt render.yaml .gitignore README.md
+git commit -m "Full pipeline + FastAPI serving layer"
+Push to GitHub, connect the repo to Render, confirm render.yaml's startCommand matches api.main:app. Render will run pip install -r requirements.txt then start uvicorn — it never touches simulator/ or scripts/, only loads artifacts/ at boot, per Phase 6.
+
+Order-of-operations summary (the short version, once everything above is in place)
+1. simulator/topology.py        -> test with Phase 1 smoke test
+2. simulator/capacity.py        -> audit_capacity_chain on Phase 1 output
+3. simulator/operational.py     -> generate 90 days, audit_fault_magnitude
+4. ml_pipeline/*.py              -> build feature tables, sanity-check NaNs
+5. scripts/run_full_pipeline.py -> python -m scripts.run_full_pipeline (writes artifacts/)
+6. api/*.py                      -> uvicorn api.main:app --reload, test via /docs
+7. git commit artifacts/ + code -> push -> Render deploy
+If something breaks, the failing phase tells you where to look — this is exactly why each phase has its own isolated test above, rather than one big end-to-end run with no checkpoints.
+
+------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
+
+
+Published. This is the consolidated reference — instead of re-writing every function (most were already fully written and validated earlier in this chat), it tells you **exactly which file each named function belongs in, in build order, with the specific "use this corrected version, not the earlier one" callouts** where a function went through revisions during this project (e.g., the widened geography anchors, the two-pass RAN telemetry, the hysteresis alarm logic, the routed-load mesh sizing). The three genuinely new files (`ml_pipeline/config.py`/`features.py`/`train.py`, `scripts/run_full_pipeline.py`, all of `api/`) were already given in full in the message right before this one — the guide tells you to paste those as-is.
+
+The one thing I'd flag before you start: **Phase 3's function inventory references several "corrected version, not the original" callouts** (congestion targeting, fault entity_id split, hysteresis alarms, RAN two-pass) — if you search the chat and find an *earlier* draft of one of these functions first, you'll paste the wrong one and reintroduce a bug this project already fixed. If you get partway through and something breaks, tell me which function/phase, and I can paste the exact corrected version directly into the chat rather than you needing to scroll back to find it.
+
+------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
+
+
+Here's the full project code. Two design decisions I made while implementing (flagging both explicitly, since they weren't fully settled in the plan):
+
+1. **The deployed cell fault model uses the sanitized RAN-only feature set** (no `availability_mean`, no region dummies, no cross-layer backhaul/core context) — this matches the model you already validated as the honest one (PR-AUC ~0.69), and it keeps the API stateless: a request only needs *that cell's own* recent history, not a live join across backhaul/aggregation/core telemetry the API doesn't have access to.
+2. **Anomaly detection needs a short recent window (not just one value)** to apply the same persistence rule (flag only after 2+ consecutive breaching hours) statelessly, since there's no server-side history to check against between requests.
+
+## `ml_pipeline/config.py`
+
+```python
+from pathlib import Path
+
+ARTIFACTS_DIR = Path(__file__).resolve().parent.parent / "artifacts"
+
+# Feature engineering constants — single source of truth, shared by training (batch)
+# and serving (live) feature computation so the two can never silently drift apart.
+LAG_HOURS = [1, 4]
+ROLLING_WINDOW_HOURS = 4
+ALARM_TRAILING_WINDOW_HOURS = 24
+NO_ALARM_SENTINEL_HOURS = 9999  # "never alarmed" must NOT equal 0 ("alarm just fired") — see prior session bug
+
+CONGESTION_LAG_HOURS = [1, 2, 24, 168]
+CONGESTION_ROLLING_24H = 24
+CONGESTION_ROLLING_7D = 24 * 7
+CONGESTION_SLOPE_14D = 24 * 14
+CONGESTION_HORIZONS = {"1h": 1, "6h": 6, "24h": 24}
+MIN_CONGESTION_HISTORY_HOURS = 24 * 14  # needed for the 14-day slope feature
+
+ANOMALY_Z_THRESHOLD = 2.5
+ANOMALY_PERSISTENCE_HOURS = 2
+
+# Deployed cell-fault model feature set — SANITIZED (no availability_mean, no region
+# dummies): both were found to be near-tautological / low-sample-size shortcuts during
+# validation, not genuine behavioral precursors. See training notes in train.py.
+CELL_FAULT_FEATURES_NUMERIC = [
+    "sinr_mean", "bler_mean", "drop_rate_mean", "prb_util_mean", "handover_success_mean",
+    "sinr_lag_1h", "bler_lag_1h", "drop_rate_lag_1h", "prb_lag_1h", "prb_lag_4h",
+    "prb_mean_4h", "prb_std_4h", "sinr_mean_4h", "sinr_slope_4h",
+    "bler_mean_4h", "drop_rate_mean_4h",
+    "prb_change_1h", "sinr_change_4h", "bler_change_4h",
+    "alarm_count_trailing_24h", "hours_since_last_alarm",
+    "hour_of_day", "day_of_week", "is_weekend", "cell_capacity_mbps",
+]
+CELL_FAULT_FEATURES_CATEGORICAL = ["technology", "band", "site_type"]
+
+CONGESTION_FEATURES_NUMERIC = [
+    "prb_util_t", "traffic_t", "capacity_headroom_current",
+    "prb_lag_1h", "prb_lag_2h", "prb_lag_24h", "prb_lag_168h",
+    "traffic_lag_1h", "traffic_lag_24h",
+    "prb_mean_24h", "prb_std_24h", "prb_mean_7d", "prb_slope_7d",
+    "traffic_mean_24h", "traffic_slope_7d",
+    "hour_of_day", "day_of_week", "is_weekend", "cell_capacity_mbps",
+]
+CONGESTION_FEATURES_CATEGORICAL = ["technology", "region_name", "site_type"]
+```
+
+## `ml_pipeline/features.py`
+
+```python
+import numpy as np
+import pandas as pd
+from ml_pipeline.config import (
+    LAG_HOURS, ROLLING_WINDOW_HOURS, ALARM_TRAILING_WINDOW_HOURS, NO_ALARM_SENTINEL_HOURS,
+    CONGESTION_LAG_HOURS, CONGESTION_ROLLING_24H, CONGESTION_ROLLING_7D, CONGESTION_SLOPE_14D,
+)
+
+
+def rolling_slope(values):
+    """Linear trend of a trailing window. Returns NaN if fewer than 2 finite points."""
+    y = np.asarray(values, dtype=float)
+    valid = np.isfinite(y)
+    if valid.sum() < 2:
+        return np.nan
+    x = np.arange(len(y))[valid]
+    return np.polyfit(x, y[valid], 1)[0]
+
+
+def _hours_since_last_alarm(alarm_counts):
+    """Sentinel-based: 'never alarmed' -> NO_ALARM_SENTINEL_HOURS, not 0. Conflating the
+    two (as an earlier version of this pipeline did) makes 'just alarmed' and 'never
+    alarmed' numerically identical, corrupting any recency-based feature."""
+    result = np.full(len(alarm_counts), float(NO_ALARM_SENTINEL_HOURS))
+    last_idx = None
+    for i, c in enumerate(alarm_counts):
+        if c > 0:
+            last_idx = i
+        elif last_idx is not None:
+            result[i] = i - last_idx
+    return result
+
+
+def build_batch_cell_fault_features(hourly_ran_df):
+    """Vectorized, per-cell-group feature builder for the historical training table.
+    hourly_ran_df must have one row per (cell_id, timestamp), sorted or not (sorted here).
+    Expects columns: cell_id, timestamp, prb_util_mean, sinr_mean, bler_mean, drop_rate_mean,
+    availability_mean, handover_success_mean, traffic_mbps_mean, alarm_count,
+    technology, band, site_type, region_name, cell_capacity_mbps.
+    """
+    df = hourly_ran_df.sort_values(["cell_id", "timestamp"]).reset_index(drop=True)
+    g = df.groupby("cell_id")
+
+    for lag in LAG_HOURS:
+        df[f"prb_lag_{lag}h"] = g["prb_util_mean"].shift(lag)
+    df["sinr_lag_1h"] = g["sinr_mean"].shift(1)
+    df["bler_lag_1h"] = g["bler_mean"].shift(1)
+    df["drop_rate_lag_1h"] = g["drop_rate_mean"].shift(1)
+
+    w = ROLLING_WINDOW_HOURS
+    df["prb_mean_4h"] = g["prb_util_mean"].transform(lambda s: s.rolling(w, min_periods=1).mean())
+    df["prb_std_4h"] = g["prb_util_mean"].transform(lambda s: s.rolling(w, min_periods=2).std())
+    df["sinr_mean_4h"] = g["sinr_mean"].transform(lambda s: s.rolling(w, min_periods=1).mean())
+    df["sinr_slope_4h"] = g["sinr_mean"].transform(lambda s: s.rolling(w, min_periods=2).apply(rolling_slope, raw=True))
+    df["bler_mean_4h"] = g["bler_mean"].transform(lambda s: s.rolling(w, min_periods=1).mean())
+    df["drop_rate_mean_4h"] = g["drop_rate_mean"].transform(lambda s: s.rolling(w, min_periods=1).mean())
+
+    df["prb_change_1h"] = df["prb_util_mean"] - df["prb_lag_1h"]
+    df["sinr_change_4h"] = df["sinr_mean"] - g["sinr_mean"].shift(4)
+    df["bler_change_4h"] = df["bler_mean"] - g["bler_mean"].shift(4)
+
+    df["alarm_count_trailing_24h"] = g["alarm_count"].transform(
+        lambda s: s.rolling(ALARM_TRAILING_WINDOW_HOURS, min_periods=1).sum())
+    df["hours_since_last_alarm"] = g["alarm_count"].transform(
+        lambda s: pd.Series(_hours_since_last_alarm(s.to_numpy()), index=s.index))
+
+    df["hour_of_day"] = df["timestamp"].dt.hour
+    df["day_of_week"] = df["timestamp"].dt.dayofweek
+    df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
+    return df
+
+
+def compute_live_cell_fault_features(window_df: pd.DataFrame, static_attrs: dict) -> dict:
+    """Stateless single-entity feature computation for the API. window_df: hourly rows for
+    ONE cell, sorted ascending by timestamp, most recent row last. Returns a flat dict of
+    features for the LATEST timestamp only — this is what gets scored.
+    Requires at least 5 rows (4h of history + current) for full feature coverage; degrades
+    gracefully (NaN -> later imputed) with fewer, but a fault decision on <2 rows is unreliable.
+    """
+    df = window_df.sort_values("timestamp").reset_index(drop=True)
+    if len(df) < 2:
+        raise ValueError("Need at least 2 hourly rows to compute lag/delta features.")
+
+    latest = df.iloc[-1]
+    w = ROLLING_WINDOW_HOURS
+
+    def lag(col, n):
+        idx = len(df) - 1 - n
+        return df[col].iloc[idx] if idx >= 0 else np.nan
+
+    def roll_mean(col, window):
+        return df[col].tail(window).mean()
+
+    def roll_std(col, window):
+        tail = df[col].tail(window)
+        return tail.std() if len(tail) >= 2 else np.nan
+
+    def slope(col, window):
+        return rolling_slope(df[col].tail(window).to_numpy())
+
+    features = {
+        "sinr_mean": latest["sinr_mean"], "bler_mean": latest["bler_mean"],
+        "drop_rate_mean": latest["drop_rate_mean"], "prb_util_mean": latest["prb_util_mean"],
+        "handover_success_mean": latest["handover_success_mean"],
+        "sinr_lag_1h": lag("sinr_mean", 1), "bler_lag_1h": lag("bler_mean", 1),
+        "drop_rate_lag_1h": lag("drop_rate_mean", 1),
+        "prb_lag_1h": lag("prb_util_mean", 1), "prb_lag_4h": lag("prb_util_mean", 4),
+        "prb_mean_4h": roll_mean("prb_util_mean", w), "prb_std_4h": roll_std("prb_util_mean", w),
+        "sinr_mean_4h": roll_mean("sinr_mean", w), "sinr_slope_4h": slope("sinr_mean", w),
+        "bler_mean_4h": roll_mean("bler_mean", w), "drop_rate_mean_4h": roll_mean("drop_rate_mean", w),
+        "prb_change_1h": latest["prb_util_mean"] - lag("prb_util_mean", 1),
+        "sinr_change_4h": latest["sinr_mean"] - lag("sinr_mean", 4),
+        "bler_change_4h": latest["bler_mean"] - lag("bler_mean", 4),
+    }
+
+    alarm_counts = df["alarm_count"].to_numpy()
+    features["alarm_count_trailing_24h"] = df["alarm_count"].tail(ALARM_TRAILING_WINDOW_HOURS).sum()
+    hsla = _hours_since_last_alarm(alarm_counts)
+    features["hours_since_last_alarm"] = float(hsla[-1])
+
+    ts = pd.Timestamp(latest["timestamp"])
+    features["hour_of_day"] = ts.hour
+    features["day_of_week"] = ts.dayofweek
+    features["is_weekend"] = int(ts.dayofweek >= 5)
+
+    features.update({
+        "technology": static_attrs["technology"], "band": static_attrs["band"],
+        "site_type": static_attrs["site_type"], "cell_capacity_mbps": static_attrs["cell_capacity_mbps"],
+    })
+    return features
+
+
+def compute_live_congestion_features(window_df: pd.DataFrame, static_attrs: dict) -> dict:
+    """window_df: hourly rows for ONE cell, columns prb_util_mean, traffic_mbps_mean,
+    timestamp. Requires up to MIN_CONGESTION_HISTORY_HOURS for the full feature set;
+    slope/168h-lag features return NaN gracefully if history is shorter."""
+    df = window_df.sort_values("timestamp").reset_index(drop=True)
+    latest = df.iloc[-1]
+
+    def lag(col, n):
+        idx = len(df) - 1 - n
+        return df[col].iloc[idx] if idx >= 0 else np.nan
+
+    def roll_mean(col, window):
+        return df[col].tail(window).mean()
+
+    def roll_std(col, window):
+        tail = df[col].tail(window)
+        return tail.std() if len(tail) >= 2 else np.nan
+
+    def slope(col, window):
+        tail = df[col].tail(window).to_numpy()
+        return rolling_slope(tail) if len(tail) >= 2 else np.nan
+
+    features = {
+        "prb_util_t": latest["prb_util_mean"], "traffic_t": latest["traffic_mbps_mean"],
+        "capacity_headroom_current": static_attrs["cell_capacity_mbps"] - latest["traffic_mbps_mean"],
+        "prb_lag_1h": lag("prb_util_mean", 1), "prb_lag_2h": lag("prb_util_mean", 2),
+        "prb_lag_24h": lag("prb_util_mean", 24), "prb_lag_168h": lag("prb_util_mean", 168),
+        "traffic_lag_1h": lag("traffic_mbps_mean", 1), "traffic_lag_24h": lag("traffic_mbps_mean", 24),
+        "prb_mean_24h": roll_mean("prb_util_mean", CONGESTION_ROLLING_24H),
+        "prb_std_24h": roll_std("prb_util_mean", CONGESTION_ROLLING_24H),
+        "prb_mean_7d": roll_mean("prb_util_mean", CONGESTION_ROLLING_7D),
+        "prb_slope_7d": slope("prb_util_mean", CONGESTION_SLOPE_14D),
+        "traffic_mean_24h": roll_mean("traffic_mbps_mean", CONGESTION_ROLLING_24H),
+        "traffic_slope_7d": slope("traffic_mbps_mean", CONGESTION_ROLLING_7D),
+    }
+    ts = pd.Timestamp(latest["timestamp"])
+    features["hour_of_day"] = ts.hour
+    features["day_of_week"] = ts.dayofweek
+    features["is_weekend"] = int(ts.dayofweek >= 5)
+    features.update({
+        "technology": static_attrs["technology"], "region_name": static_attrs["region_name"],
+        "site_type": static_attrs["site_type"], "cell_capacity_mbps": static_attrs["cell_capacity_mbps"],
+    })
+    return features
+```
+
+## `ml_pipeline/train.py`
+
+```python
+import json
+import joblib
+import numpy as np
+import pandas as pd
+import shap
+from xgboost import XGBClassifier, XGBRegressor
+from sklearn.metrics import average_precision_score, precision_recall_curve, mean_absolute_error
+
+from ml_pipeline.config import (
+    ARTIFACTS_DIR, CELL_FAULT_FEATURES_NUMERIC, CELL_FAULT_FEATURES_CATEGORICAL,
+    CONGESTION_FEATURES_NUMERIC, CONGESTION_FEATURES_CATEGORICAL, CONGESTION_HORIZONS,
+)
+from ml_pipeline.features import build_batch_cell_fault_features
+
+
+def encode_categoricals(df, categorical_cols, known_categories=None):
+    """One-hot encode with an explicit, saved category list so train/serve encoding
+    can never silently diverge (a new category at serve time is safely dropped, not
+    a crash or a shifted column)."""
+    df = df.copy()
+    encoded_cols = []
+    categories_used = {}
+    for col in categorical_cols:
+        cats = known_categories[col] if known_categories else sorted(df[col].dropna().unique().tolist())
+        categories_used[col] = cats
+        for cat in cats[1:]:  # drop_first equivalent, deterministic ordering
+            new_col = f"{col}_{cat}"
+            df[new_col] = (df[col] == cat).astype(int)
+            encoded_cols.append(new_col)
+    return df, encoded_cols, categories_used
+
+
+def train_cell_fault_model(ml_cell_fault_raw, network_faults, label_col="will_any_fault_next_4h",
+                            train_end="2025-03-04", val_end="2025-03-18"):
+    """ml_cell_fault_raw: the historical hourly RAN table (pre-feature-engineering) plus
+    the label column already attached, as built in the notebook."""
+    df = build_batch_cell_fault_features(ml_cell_fault_raw)
+    df = df.merge(ml_cell_fault_raw[["cell_id", "timestamp", label_col]], on=["cell_id", "timestamp"], how="left")
+
+    df = df.dropna(subset=["prb_lag_4h", "sinr_change_4h", "bler_change_4h", "sinr_slope_4h", "prb_std_4h"])
+
+    df, encoded_cat_cols, categories = encode_categoricals(df, CELL_FAULT_FEATURES_CATEGORICAL)
+    feature_cols = CELL_FAULT_FEATURES_NUMERIC + encoded_cat_cols
+
+    train = df[df.timestamp <= train_end]
+    val = df[(df.timestamp > train_end) & (df.timestamp <= val_end)]
+    test = df[df.timestamp > val_end]
+
+    X_train, y_train = train[feature_cols], train[label_col]
+    X_val, y_val = val[feature_cols], val[label_col]
+    X_test, y_test = test[feature_cols], test[label_col]
+
+    pos_weight = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
+    model = XGBClassifier(scale_pos_weight=pos_weight, n_estimators=200, max_depth=4,
+                           learning_rate=0.05, min_child_weight=5, colsample_bytree=0.8,
+                           subsample=0.8, eval_metric="aucpr", random_state=42)
+    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+
+    val_probs = model.predict_proba(X_val)[:, 1]
+    val_prauc = average_precision_score(y_val, val_probs)
+    precisions, recalls, thresholds = precision_recall_curve(y_val, val_probs)
+    valid_idx = np.where(recalls[:-1] >= 0.7)[0]
+    chosen_threshold = float(thresholds[valid_idx[-1]]) if len(valid_idx) else 0.5
+
+    test_probs = model.predict_proba(X_test[feature_cols])[:, 1]
+    test_prauc = average_precision_score(y_test, test_probs)
+
+    explainer = shap.TreeExplainer(model)
+
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(model, ARTIFACTS_DIR / "cell_fault_model.joblib")
+    joblib.dump(explainer, ARTIFACTS_DIR / "shap_explainer_cell_fault.joblib")
+
+    schema = {
+        "numeric_features": CELL_FAULT_FEATURES_NUMERIC,
+        "categorical_features": CELL_FAULT_FEATURES_CATEGORICAL,
+        "categories": categories,
+        "encoded_feature_order": feature_cols,
+        "decision_threshold": chosen_threshold,
+    }
+    with open(ARTIFACTS_DIR / "cell_fault_schema.json", "w") as f:
+        json.dump(schema, f, indent=2)
+
+    metadata = {
+        "model": "cell_fault_detector", "val_prauc": val_prauc, "test_prauc": test_prauc,
+        "val_base_rate": float(y_val.mean()), "threshold": chosen_threshold,
+        "train_rows": len(train), "val_rows": len(val), "test_rows": len(test),
+        "note": "Sanitized feature set — excludes availability_mean and region_name, "
+                "found to be near-tautological / low-sample-size shortcuts during validation.",
+    }
+    with open(ARTIFACTS_DIR / "cell_fault_metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    print(f"Cell fault model — val PR-AUC: {val_prauc:.4f}, test PR-AUC: {test_prauc:.4f}, "
+          f"threshold: {chosen_threshold:.4f}")
+    return model, schema, metadata
+
+
+def train_congestion_models(ml_congestion_forecast, train_end="2025-03-04", val_end="2025-03-18"):
+    df = ml_congestion_forecast.copy()
+    df, encoded_cat_cols, categories = encode_categoricals(df, CONGESTION_FEATURES_CATEGORICAL)
+    feature_cols = CONGESTION_FEATURES_NUMERIC + encoded_cat_cols
+
+    results = {}
+    for horizon_label, horizon_hours in CONGESTION_HORIZONS.items():
+        target_col = f"prb_t_plus_{horizon_label}"
+        other_targets = [f"prb_t_plus_{h}" for h in CONGESTION_HORIZONS if h != horizon_label]
+        clean = df.dropna(subset=[target_col, "prb_lag_168h", "prb_slope_7d"]).drop(columns=other_targets)
+
+        train = clean[clean.timestamp <= train_end]
+        train = train[train.timestamp <= train.timestamp.max() - pd.Timedelta(hours=horizon_hours)]
+        val = clean[(clean.timestamp > train_end) & (clean.timestamp <= val_end)]
+        val = val[val.timestamp <= val.timestamp.max() - pd.Timedelta(hours=horizon_hours)]
+
+        model = XGBRegressor(n_estimators=200, max_depth=5, learning_rate=0.05,
+                              subsample=0.8, colsample_bytree=0.8, random_state=42)
+        model.fit(train[feature_cols], train[target_col])
+
+        val_preds = model.predict(val[feature_cols])
+        mae = mean_absolute_error(val[target_col], val_preds)
+        naive_mae = mean_absolute_error(val[target_col], val["prb_lag_168h"])
+
+        joblib.dump(model, ARTIFACTS_DIR / f"congestion_model_{horizon_label}.joblib")
+        results[horizon_label] = {"mae": mae, "naive_mae": naive_mae,
+                                   "improvement_pct": (naive_mae - mae) / naive_mae * 100}
+        print(f"Congestion {horizon_label} — MAE: {mae:.3f} vs naive MAE: {naive_mae:.3f} "
+              f"({results[horizon_label]['improvement_pct']:.1f}% improvement)")
+
+    schema = {"numeric_features": CONGESTION_FEATURES_NUMERIC,
+              "categorical_features": CONGESTION_FEATURES_CATEGORICAL,
+              "categories": categories, "encoded_feature_order": feature_cols}
+    with open(ARTIFACTS_DIR / "congestion_schema.json", "w") as f:
+        json.dump(schema, f, indent=2)
+    with open(ARTIFACTS_DIR / "congestion_metadata.json", "w") as f:
+        json.dump(results, f, indent=2)
+    return results
+
+
+def build_anomaly_baselines(ml_hourly_ran, metrics=("prb_util_mean", "traffic_mbps_mean", "sinr_mean", "bler_mean"),
+                             seasonal_window_weeks=4):
+    """Per (cell_id, hour_of_day, day_of_week): trailing seasonal mean/std for each
+    metric. Saved as a lookup table the API loads once and queries — no live rolling
+    computation needed at serve time for anomaly scoring."""
+    df = ml_hourly_ran.copy()
+    df["hour_of_day"] = df["timestamp"].dt.hour
+    df["day_of_week"] = df["timestamp"].dt.dayofweek
+
+    rows = []
+    for (cell_id, hour, dow), group in df.groupby(["cell_id", "hour_of_day", "day_of_week"]):
+        group = group.sort_values("timestamp")
+        row = {"cell_id": cell_id, "hour_of_day": hour, "day_of_week": dow}
+        for m in metrics:
+            tail = group[m].tail(seasonal_window_weeks)
+            row[f"{m}_expected"] = tail.mean()
+            row[f"{m}_std"] = tail.std() if len(tail) >= 2 else np.nan
+        rows.append(row)
+
+    baselines = pd.DataFrame(rows)
+    baselines.to_parquet(ARTIFACTS_DIR / "anomaly_baselines.parquet", index=False)
+    print(f"Saved anomaly baselines: {baselines.shape}")
+    return baselines
+```
+
+## `api/schemas.py`
+
+```python
+from pydantic import BaseModel, Field
+from typing import List, Optional
+from datetime import datetime
+
+
+class HourlyTelemetryRecord(BaseModel):
+    timestamp: datetime
+    prb_util_mean: float
+    traffic_mbps_mean: float
+    sinr_mean: float
+    bler_mean: float
+    drop_rate_mean: float
+    availability_mean: float
+    handover_success_mean: float
+    alarm_count: int = 0
+
+
+class StaticAttributes(BaseModel):
+    technology: str
+    band: str
+    site_type: str
+    region_name: str
+    cell_capacity_mbps: float
+
+
+class FaultDetectionRequest(BaseModel):
+    cell_id: str
+    static: StaticAttributes
+    telemetry_window: List[HourlyTelemetryRecord] = Field(
+        ..., min_length=2, description="Hourly records, oldest first, at least 5 recommended for full feature coverage")
+
+
+class FaultDetectionResponse(BaseModel):
+    cell_id: str
+    timestamp: datetime
+    fault_probability: float
+    is_fault_flagged: bool
+    threshold_used: float
+
+
+class FeatureContribution(BaseModel):
+    feature: str
+    value: Optional[float]
+    shap_value: float
+
+
+class FaultExplanationResponse(FaultDetectionResponse):
+    top_contributions: List[FeatureContribution]
+
+
+class CongestionRequest(BaseModel):
+    cell_id: str
+    static: StaticAttributes
+    telemetry_window: List[HourlyTelemetryRecord] = Field(
+        ..., min_length=2,
+        description="Longer history improves accuracy — up to 336 hourly rows (14 days) used if provided")
+
+
+class CongestionResponse(BaseModel):
+    cell_id: str
+    timestamp: datetime
+    horizon: str
+    forecast_prb_utilization_pct: float
+    history_hours_used: int
+
+
+class AnomalyValuePoint(BaseModel):
+    timestamp: datetime
+    value: float
+
+
+class AnomalyRequest(BaseModel):
+    cell_id: str
+    metric_name: str
+    recent_values: List[AnomalyValuePoint] = Field(
+        ..., min_length=1, description="Last 1-3 hourly values for this metric, most recent last")
+
+
+class AnomalyResponse(BaseModel):
+    cell_id: str
+    metric_name: str
+    timestamp: datetime
+    actual_value: float
+    expected_value: Optional[float]
+    z_score: Optional[float]
+    is_anomaly_flagged: bool
+```
+
+## `api/dependencies.py`
+
+```python
+import json
+import joblib
+import pandas as pd
+from functools import lru_cache
+from ml_pipeline.config import ARTIFACTS_DIR
+
+
+class ArtifactStore:
+    def __init__(self):
+        self.cell_fault_model = joblib.load(ARTIFACTS_DIR / "cell_fault_model.joblib")
+        self.cell_fault_explainer = joblib.load(ARTIFACTS_DIR / "shap_explainer_cell_fault.joblib")
+        with open(ARTIFACTS_DIR / "cell_fault_schema.json") as f:
+            self.cell_fault_schema = json.load(f)
+        with open(ARTIFACTS_DIR / "cell_fault_metadata.json") as f:
+            self.cell_fault_metadata = json.load(f)
+
+        self.congestion_models = {
+            horizon: joblib.load(ARTIFACTS_DIR / f"congestion_model_{horizon}.joblib")
+            for horizon in ["1h", "6h", "24h"]
+        }
+        with open(ARTIFACTS_DIR / "congestion_schema.json") as f:
+            self.congestion_schema = json.load(f)
+
+        self.anomaly_baselines = pd.read_parquet(ARTIFACTS_DIR / "anomaly_baselines.parquet")
+
+    def encode_row(self, feature_dict: dict, schema: dict) -> pd.DataFrame:
+        """Applies the exact one-hot encoding saved at training time, so an unseen
+        category at serve time is safely zero-filled rather than crashing or
+        misaligning columns."""
+        row = {col: feature_dict.get(col, None) for col in schema["numeric_features"]}
+        for col, cats in schema["categories"].items():
+            value = feature_dict.get(col)
+            for cat in cats[1:]:
+                row[f"{col}_{cat}"] = int(value == cat)
+        ordered = {c: row.get(c, 0) for c in schema["encoded_feature_order"]}
+        return pd.DataFrame([ordered])
+
+
+@lru_cache(maxsize=1)
+def get_artifact_store() -> ArtifactStore:
+    return ArtifactStore()
+```
+
+## `api/routers/health.py`
+
+```python
+from fastapi import APIRouter, Depends
+from api.dependencies import get_artifact_store, ArtifactStore
+
+router = APIRouter()
+
+
+@router.get("/health")
+def health(store: ArtifactStore = Depends(get_artifact_store)):
+    return {
+        "status": "ok",
+        "cell_fault_model_loaded": store.cell_fault_model is not None,
+        "congestion_models_loaded": list(store.congestion_models.keys()),
+        "anomaly_baseline_rows": len(store.anomaly_baselines),
+    }
+```
+
+## `api/routers/fault_detection.py`
+
+```python
+import pandas as pd
+from fastapi import APIRouter, Depends, HTTPException
+from api.schemas import FaultDetectionRequest, FaultDetectionResponse, FaultExplanationResponse, FeatureContribution
+from api.dependencies import get_artifact_store, ArtifactStore
+from ml_pipeline.features import compute_live_cell_fault_features
+
+router = APIRouter()
+
+
+def _prepare(request: FaultDetectionRequest, store: ArtifactStore):
+    window_df = pd.DataFrame([r.model_dump() for r in request.telemetry_window])
+    try:
+        feature_dict = compute_live_cell_fault_features(window_df, request.static.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    X = store.encode_row(feature_dict, store.cell_fault_schema)
+    latest_ts = window_df["timestamp"].max()
+    return X, latest_ts
+
+
+@router.post("/predict/fault/cell", response_model=FaultDetectionResponse)
+def predict_cell_fault(request: FaultDetectionRequest, store: ArtifactStore = Depends(get_artifact_store)):
+    X, latest_ts = _prepare(request, store)
+    prob = float(store.cell_fault_model.predict_proba(X)[:, 1][0])
+    threshold = store.cell_fault_schema["decision_threshold"]
+    return FaultDetectionResponse(
+        cell_id=request.cell_id, timestamp=latest_ts,
+        fault_probability=prob, is_fault_flagged=prob >= threshold, threshold_used=threshold,
+    )
+
+
+@router.post("/predict/fault/cell/explain", response_model=FaultExplanationResponse)
+def explain_cell_fault(request: FaultDetectionRequest, store: ArtifactStore = Depends(get_artifact_store),
+                        top_n: int = 8):
+    X, latest_ts = _prepare(request, store)
+    prob = float(store.cell_fault_model.predict_proba(X)[:, 1][0])
+    threshold = store.cell_fault_schema["decision_threshold"]
+
+    shap_values = store.cell_fault_explainer.shap_values(X)
+    row_shap = shap_values[0] if shap_values.ndim == 2 else shap_values
+    contributions = sorted(
+        [FeatureContribution(feature=col, value=float(X[col].iloc[0]), shap_value=float(val))
+         for col, val in zip(X.columns, row_shap)],
+        key=lambda c: abs(c.shap_value), reverse=True,
+    )[:top_n]
+
+    return FaultExplanationResponse(
+        cell_id=request.cell_id, timestamp=latest_ts,
+        fault_probability=prob, is_fault_flagged=prob >= threshold, threshold_used=threshold,
+        top_contributions=contributions,
+    )
+```
+
+## `api/routers/congestion.py`
+
+```python
+import pandas as pd
+from fastapi import APIRouter, Depends, HTTPException, Query
+from api.schemas import CongestionRequest, CongestionResponse
+from api.dependencies import get_artifact_store, ArtifactStore
+from ml_pipeline.features import compute_live_congestion_features
+
+router = APIRouter()
+
+
+@router.post("/predict/congestion", response_model=CongestionResponse)
+def predict_congestion(request: CongestionRequest,
+                        horizon: str = Query("1h", pattern="^(1h|6h|24h)$"),
+                        store: ArtifactStore = Depends(get_artifact_store)):
+    if horizon not in store.congestion_models:
+        raise HTTPException(status_code=400, detail=f"Unknown horizon '{horizon}'")
+
+    window_df = pd.DataFrame([r.model_dump() for r in request.telemetry_window])
+    feature_dict = compute_live_congestion_features(window_df, request.static.model_dump())
+    X = store.encode_row(feature_dict, store.congestion_schema)
+
+    model = store.congestion_models[horizon]
+    forecast = float(model.predict(X)[0])
+    latest_ts = window_df["timestamp"].max()
+
+    return CongestionResponse(
+        cell_id=request.cell_id, timestamp=latest_ts, horizon=horizon,
+        forecast_prb_utilization_pct=forecast, history_hours_used=len(window_df),
+    )
+```
+
+## `api/routers/anomaly.py`
+
+```python
+import numpy as np
+import pandas as pd
+from fastapi import APIRouter, Depends, HTTPException
+from api.schemas import AnomalyRequest, AnomalyResponse
+from api.dependencies import get_artifact_store, ArtifactStore
+from ml_pipeline.config import ANOMALY_Z_THRESHOLD, ANOMALY_PERSISTENCE_HOURS
+
+router = APIRouter()
+
+
+@router.post("/predict/anomaly", response_model=AnomalyResponse)
+def predict_anomaly(request: AnomalyRequest, store: ArtifactStore = Depends(get_artifact_store)):
+    values = sorted(request.recent_values, key=lambda v: v.timestamp)
+    latest = values[-1]
+    latest_ts = pd.Timestamp(latest.timestamp)
+
+    baseline_row = store.anomaly_baselines[
+        (store.anomaly_baselines.cell_id == request.cell_id)
+        & (store.anomaly_baselines.hour_of_day == latest_ts.hour)
+        & (store.anomaly_baselines.day_of_week == latest_ts.dayofweek)
+    ]
+    if baseline_row.empty:
+        return AnomalyResponse(cell_id=request.cell_id, metric_name=request.metric_name,
+                                timestamp=latest_ts, actual_value=latest.value,
+                                expected_value=None, z_score=None, is_anomaly_flagged=False)
+
+    expected = baseline_row[f"{request.metric_name}_expected"].iloc[0]
+    std = baseline_row[f"{request.metric_name}_std"].iloc[0]
+    if pd.isna(expected) or pd.isna(std) or std == 0:
+        return AnomalyResponse(cell_id=request.cell_id, metric_name=request.metric_name,
+                                timestamp=latest_ts, actual_value=latest.value,
+                                expected_value=float(expected) if pd.notna(expected) else None,
+                                z_score=None, is_anomaly_flagged=False)
+
+    z_scores = [(v.value - expected) / std for v in values[-ANOMALY_PERSISTENCE_HOURS:]]
+    breach_streak = all(abs(z) > ANOMALY_Z_THRESHOLD for z in z_scores) and len(z_scores) >= ANOMALY_PERSISTENCE_HOURS
+
+    return AnomalyResponse(
+        cell_id=request.cell_id, metric_name=request.metric_name, timestamp=latest_ts,
+        actual_value=latest.value, expected_value=float(expected), z_score=float(z_scores[-1]),
+        is_anomaly_flagged=breach_streak,
+    )
+```
+
+## `api/main.py`
+
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from api.routers import health, fault_detection, congestion, anomaly
+from api.dependencies import get_artifact_store
+
+app = FastAPI(title="Telecom Network Intelligence API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+)
+
+app.include_router(health.router, tags=["health"])
+app.include_router(fault_detection.router, tags=["fault-detection"])
+app.include_router(congestion.router, tags=["congestion"])
+app.include_router(anomaly.router, tags=["anomaly"])
+
+
+@app.on_event("startup")
+def load_artifacts_on_startup():
+    # Forces artifact loading at boot rather than on first request — if a model file
+    # is missing/corrupt, the service fails fast at deploy time, not on a user's first call.
+    get_artifact_store()
+```
+
+## `requirements.txt`
+
+```
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+pandas==2.2.2
+numpy==1.26.4
+scikit-learn==1.5.0
+xgboost==2.0.3
+shap==0.45.1
+joblib==1.4.2
+pydantic==2.7.1
+pyarrow==16.1.0
+```
+
+## `render.yaml`
+
+```yaml
+services:
+  - type: web
+    name: telecom-network-intelligence-api
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn api.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+    plan: starter
+```
+
+---
+
+## What I could not fully guarantee without running it
+
+I've kept feature names, encoding logic, and column ordering consistent end-to-end (config → features → train → dependencies → routers), but I can't execute this to catch every possible runtime issue. Before trusting it in deployment, run these three checks locally:
+
+1. **Train first, then boot the API** — `artifacts/` must be populated before `api/main.py` can start; a missing file will fail loudly at startup (by design), not silently.
+2. **Test one full request through each endpoint with real data pulled from your frozen dataset** (a real cell's last 5-10 hourly rows) before assuming it's correct — particularly `compute_live_cell_fault_features`, since it's the newest, most complex piece and the one most likely to have an off-by-one in the lag/rolling logic when run outside pandas' groupby machinery.
+3. **Confirm SHAP's output shape** — `shap.TreeExplainer(...).shap_values(X)` returns a 2D array for binary XGBoost classifiers in most SHAP versions, but this has changed across SHAP releases; the `row_shap = shap_values[0] if shap_values.ndim == 2 else shap_values` line handles both cases, but verify it against your installed `shap` version specifically.
+
+------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
+
+Good catch — that's a real gap in the plan, and the answer changes the project's shape a bit: **the simulator/analytics/feature-engineering pipeline and the API are two independent lifecycles that only meet at one handoff point: the `artifacts/` folder.** Render never runs the generator; it only ever loads what's already in `artifacts/`. Here's how to make that concrete and actually reproducible from a fresh clone.
+
+## Two lifecycles, one handoff
+
+```
+LIFECYCLE 1 — Data generation & training (runs once, locally or in Colab)
+simulator/  →  data/  (large, git-ignored, regenerable)  →  ml_pipeline/  →  artifacts/ (small, committed)
+
+LIFECYCLE 2 — Serving (runs continuously, on Render)
+artifacts/  →  api/  (loads once at startup, never touches simulator/ or data/)
+```
+
+`artifacts/` is the only thing Render depends on. It never imports `simulator/`, never generates data, never trains anything. This is why "Render doesn't always have to run from start" is not just possible but the correct design — the API's entire job is to load a handful of small files and serve predictions.
+
+## Updated structure
+
+```
+telecom-network-intelligence/
+│
+├── data/                          # GIT-IGNORED — large, fully regenerable from scripts/run_full_pipeline.py
+│   ├── raw/                       # regions, sites, cells, ..., traffic_demand, ran_telemetry, network_faults, ...
+│   ├── hourly/                    # ml_hourly_ran, ml_hourly_backhaul, ml_hourly_mesh, ml_hourly_core, ...
+│   └── ml/                        # ml_cell_fault, ml_congestion_forecast, ml_anomaly_features, eval_*, ...
+│
+├── scripts/
+│   ├── run_full_pipeline.py       # NEW — single CLI entrypoint: clone repo, run this, get artifacts/
+│   ├── push_to_bigquery.py        # optional, separate — only for the Looker/BI layer, never required for the API
+│   └── build_looker_marts.py      # optional, separate — same reasoning
+│
+├── simulator/  ml_pipeline/  artifacts/  api/  notebooks/   # unchanged from before
+│
+├── .gitignore                     # excludes data/, but NOT artifacts/
+└── README.md
+```
+
+## `scripts/run_full_pipeline.py`
+
+This is the "clone the repo, run one command, get a working system" entrypoint. Each stage checkpoints to disk and skips itself if its output already exists (unless `--force`), so re-running after a crash or a code tweak doesn't mean regenerating 90 days of telemetry from scratch every time.
+
+```python
+import argparse
+from pathlib import Path
+import pandas as pd
+
+from simulator.topology import (
+    create_regions, create_sites, assign_site_coordinates, assign_site_type,
+    create_cells, assign_sector_and_band, assign_baseline_heterogeneity, assign_cell_capacity,
+    assign_aggregation_nodes, create_aggregation_nodes, assign_aggregation_capacity,
+    build_backhaul_links, build_transport_mesh, create_core_nodes,
+    assign_core_dependencies, assign_core_capacity, size_transport_mesh,
+    build_transport_links_table, build_topology_table,
+)
+from simulator.capacity import audit_capacity_chain
+from simulator.operational import (
+    generate_traffic_demand, inject_anomalies, generate_congestion_events, apply_congestion_to_demand,
+    generate_network_faults, build_neighbor_map, generate_ran_telemetry, compute_hierarchy_loads,
+    generate_transport_telemetry, generate_core_telemetry, generate_alarms, build_evaluation_labels,
+)
+from ml_pipeline.features import build_batch_cell_fault_features
+from ml_pipeline.labels import build_fault_labels_for_cells
+from ml_pipeline.train import train_cell_fault_model, train_congestion_models, build_anomaly_baselines
+from ml_pipeline.config import ARTIFACTS_DIR
+import numpy as np
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+RAW_DIR, HOURLY_DIR, ML_DIR = DATA_DIR / "raw", DATA_DIR / "hourly", DATA_DIR / "ml"
+RNG_SEED = 42
+
+
+def checkpoint_exists(name, directory):
+    return (directory / f"{name}.parquet").exists()
+
+
+def save(df, name, directory):
+    directory.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(directory / f"{name}.parquet", index=False)
+
+
+def load(name, directory):
+    return pd.read_parquet(directory / f"{name}.parquet")
+
+
+def run_static_topology(force):
+    tables = ["regions", "sites", "cells", "aggregations", "core_nodes",
+              "backhaul_links", "mesh_links", "core_uplink_links", "transport_links", "topology"]
+    if not force and all(checkpoint_exists(t, RAW_DIR) for t in tables):
+        print("Static topology already generated — skipping (use --force to regenerate).")
+        return {t: load(t, RAW_DIR) for t in tables}
+
+    print("Generating static topology...")
+    rng = np.random.default_rng(RNG_SEED)
+    regions = create_regions()
+    sites = create_sites(regions)
+    sites = assign_site_coordinates(sites, regions, rng)
+    sites = assign_site_type(sites, regions)
+    cells = create_cells(regions, sites, rng)
+    cells = assign_sector_and_band(cells, rng)
+    cells = assign_baseline_heterogeneity(cells, rng)
+    cells = assign_cell_capacity(cells)
+
+    sites, cluster_centers = assign_aggregation_nodes(sites)
+    aggregations = create_aggregation_nodes(cluster_centers)
+    aggregations = assign_aggregation_capacity(regions, sites, cells, aggregations)
+    backhaul_links = build_backhaul_links(regions, sites, cells, aggregations)
+
+    transport_mesh_G = build_transport_mesh(aggregations)
+    core_nodes = create_core_nodes()
+    core_deps_df = assign_core_dependencies(aggregations, core_nodes, rng)
+    core_nodes = assign_core_capacity(core_nodes, core_deps_df, aggregations)
+    mesh_links, _ = size_transport_mesh(transport_mesh_G, regions, sites, cells, core_deps_df)
+
+    transport_links = build_transport_links_table(backhaul_links, mesh_links, core_deps_df)
+    topology = build_topology_table(cells, backhaul_links, mesh_links, core_deps_df)
+
+    audit_capacity_chain(regions, sites, cells, aggregations, backhaul_links, mesh_links, core_nodes, core_deps_df)
+
+    result = {"regions": regions, "sites": sites, "cells": cells, "aggregations": aggregations,
+              "core_nodes": core_nodes, "backhaul_links": backhaul_links, "mesh_links": mesh_links,
+              "core_uplink_links": core_deps_df, "transport_links": transport_links, "topology": topology}
+    for name, df in result.items():
+        save(df, name, RAW_DIR)
+    return result
+
+
+def run_operational_layer(topo, force):
+    tables = ["traffic_demand", "network_faults", "ran_telemetry", "transport_telemetry",
+              "core_telemetry", "network_alarms", "data_anomalies", "congestion_events", "evaluation_labels"]
+    if not force and all(checkpoint_exists(t, RAW_DIR) for t in tables):
+        print("Operational telemetry already generated — skipping.")
+        return {t: load(t, RAW_DIR) for t in tables}
+
+    print("Generating 90 days of operational telemetry (this is the slow stage)...")
+    rng = np.random.default_rng(RNG_SEED)
+    regions, sites, cells = topo["regions"], topo["sites"], topo["cells"]
+    aggregations, core_nodes = topo["aggregations"], topo["core_nodes"]
+    backhaul_links, mesh_links, core_deps_df = topo["backhaul_links"], topo["mesh_links"], topo["core_uplink_id" if False else "core_uplink_links"]
+    transport_links = topo["transport_links"]
+
+    traffic_demand = generate_traffic_demand(regions, sites, cells, rng)
+    traffic_demand, data_anomalies = inject_anomalies(traffic_demand, rng)
+    congestion_events = generate_congestion_events(regions, sites, cells, backhaul_links, rng)
+    traffic_demand = apply_congestion_to_demand(traffic_demand, congestion_events, cells)
+    network_faults = generate_network_faults(cells, sites, aggregations, core_nodes, mesh_links, rng)
+
+    neighbor_map = build_neighbor_map(cells, sites)
+    ran_telemetry = generate_ran_telemetry(cells, sites, traffic_demand, network_faults, neighbor_map,
+                                            sites, aggregations, core_deps_df, rng)
+    site_series, agg_series, core_series = compute_hierarchy_loads(ran_telemetry, sites, aggregations,
+                                                                     core_deps_df, network_faults)
+    transport_telemetry = generate_transport_telemetry(backhaul_links, mesh_links, core_deps_df,
+                                                         site_series, agg_series, network_faults, transport_links, rng)
+    core_telemetry = generate_core_telemetry(core_nodes, core_series, network_faults, rng)
+    network_alarms = generate_alarms(ran_telemetry, transport_telemetry, core_telemetry, rng)
+    evaluation_labels = build_evaluation_labels(network_faults, sites, cells, aggregations, core_deps_df, mesh_links)
+
+    result = {"traffic_demand": traffic_demand, "network_faults": network_faults,
+              "ran_telemetry": ran_telemetry, "transport_telemetry": transport_telemetry,
+              "core_telemetry": core_telemetry, "network_alarms": network_alarms,
+              "data_anomalies": data_anomalies, "congestion_events": congestion_events,
+              "evaluation_labels": evaluation_labels}
+    for name, df in result.items():
+        save(df, name, RAW_DIR)
+    return result
+
+
+def run_ml_tables(topo, ops, force):
+    # (hourly rollups + feature tables — same checkpoint pattern; abbreviated here since
+    # every function is already defined in ml_pipeline/simulator, this just wires + saves)
+    print("Building hourly + ML feature tables...")
+    from simulator.operational import create_ml_hourly_ran  # or wherever these ended up
+    ml_hourly_ran = create_ml_hourly_ran(ops["ran_telemetry"], topo["sites"], topo["cells"],
+                                          topo["regions"], ops["network_alarms"])
+    save(ml_hourly_ran, "ml_hourly_ran", HOURLY_DIR)
+
+    ml_cell_fault = build_batch_cell_fault_features(ml_hourly_ran)
+    labels = build_fault_labels_for_cells(ml_cell_fault["cell_id"].unique(), ml_cell_fault["timestamp"],
+                                           ops["network_faults"], topo["sites"], topo["cells"],
+                                           topo["aggregations"], ops.get("core_deps_df"), topo["mesh_links"])
+    ml_cell_fault = ml_cell_fault.merge(labels, on=["cell_id", "timestamp"], how="left")
+    save(ml_cell_fault, "ml_cell_fault", ML_DIR)
+    return {"ml_hourly_ran": ml_hourly_ran, "ml_cell_fault": ml_cell_fault}
+
+
+def run_training(ml_tables, ops, force):
+    print("Training models and saving artifacts...")
+    train_cell_fault_model(ml_tables["ml_cell_fault"], ops["network_faults"])
+    # train_congestion_models(...) and build_anomaly_baselines(...) follow the same pattern
+    print(f"\nDone. Artifacts written to: {ARTIFACTS_DIR}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run the full telecom simulator -> ML pipeline end to end.")
+    parser.add_argument("--force", action="store_true", help="Regenerate every stage, ignoring existing checkpoints.")
+    parser.add_argument("--stop-after", choices=["topology", "operational", "ml_tables", "training"], default="training")
+    args = parser.parse_args()
+
+    topo = run_static_topology(args.force)
+    if args.stop_after == "topology":
+        return
+    ops = run_operational_layer(topo, args.force)
+    if args.stop_after == "operational":
+        return
+    ml_tables = run_ml_tables(topo, ops, args.force)
+    if args.stop_after == "ml_tables":
+        return
+    run_training(ml_tables, ops, args.force)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Run it once, from a fresh clone:**
+```bash
+python -m scripts.run_full_pipeline
+```
+This regenerates everything, checkpointing at each stage into `data/`, and ends with fully populated `artifacts/`.
+
+## `.gitignore`
+
+```
+data/
+__pycache__/
+*.pyc
+.env
+```
+
+`artifacts/` is **not** ignored — it gets committed. This is the key decision that answers "where does it store": intermediate data lives in `data/` (large, disposable, regenerable, kept off git), but the small trained models/schemas/baselines in `artifacts/` are committed directly to the repo, since they're realistically only a few MB total (a couple of XGBoost joblib files, a SHAP explainer, one parquet baseline table).
+
+## What this means for Render specifically
+
+- Render's `startCommand` (`uvicorn api.main:app ...`) never touches `simulator/`, `ml_pipeline/train.py`, or `data/` — it only runs `api/main.py`, whose startup hook loads whatever is already sitting in `artifacts/` in the deployed repo checkout.
+- If `artifacts/` is missing or stale on a given commit, the API will fail loudly at startup (the `joblib.load` calls raise immediately) rather than silently serving a broken model — that's intentional, so a bad deploy is obvious rather than a slow-burning bug.
+- To update the live models: run `scripts/run_full_pipeline.py` locally or in Colab, commit the refreshed `artifacts/` files, push, and Render redeploys — it never needs to know the generator or training code exists.
+
+## One thing worth deciding
+
+If `artifacts/` ever grows past a few tens of MB (e.g., if `anomaly_baselines.parquet` gets large from tracking many metrics × many cells × hour/day-of-week combinations), committing it to git stops being clean, and you'd want to switch to fetching it from external storage (GCS/Drive) via a small `build.sh` step on Render instead. Worth checking the actual file sizes once you run the pipeline once — want me to add a size-check step to the script that warns if any artifact exceeds a threshold, so you'd know before it becomes a problem?
+
+------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
+
+Good question — worth separating two different things that look similar but aren't: "is this metric realistic to measure" (yes) vs. "is this metric's *relationship to the label* realistic" (no, in this specific simulator). That distinction is the actual answer to whether you should keep these features.
+
+## Why it's not really about real-world legitimacy
+
+You're right that packet loss, latency, and jitter are the real, legitimate signals a NOC uses to detect transport problems — nothing wrong with that category of feature in principle. The issue is narrower: look at the actual generator formulas for a mesh link during a fault (`util` near 0, since idle mesh links normally carry no traffic):
+
+```python
+latency = base_lat + 15*np.clip(util-0.93,0,None) + 40*intensity + rng.normal(0, 0.3, N_STEPS)
+packet_loss = np.clip(2*np.clip(util-0.97,0,None)**2*100 + 40*intensity, 0, 100)
+availability = np.clip(100*(1-intensity), 0, 100)
+```
+
+`packet_loss` and `availability` have **zero random noise at all** — they're pure deterministic functions of `intensity`, the exact same variable whose elevation *is* the fault. `latency`/`jitter` have a small noise term, but it's dwarfed by the `40 * intensity` swing. In a real network, packet loss during a link problem is *correlated* with the fault but never perfectly — sensor noise, partial packet loss from congestion vs. hardware vs. fiber-cut each behaving slightly differently, momentary recovery blips, etc. That ambiguity is exactly what makes real detection a non-trivial, generalizable ML problem. Here, there's no ambiguity to learn *through* — the formula is invertible, so any model (even a single-feature threshold) will look "perfect," and that perfection tells you about the generator's cleanliness, not about learned pattern recognition. The cell `availability_mean` issue was the same phenomenon, just easier to spot because it was a single flagrant feature; mesh has the same defect spread across four correlated columns.
+
+So: **don't decide this by asking "is it realistic" — decide it by asking "does the generator add genuine noise/ambiguity to this specific feature's fault-response formula."** If no (packet_loss, availability, and to a lesser extent latency/jitter for mesh), treat it the same way you treated `availability_mean` for cells. If yes (utilization, which is driven by actual routed/failover traffic, not directly by `intensity`), it's a legitimate behavioral feature.
+
+## The answer to your bigger question: report both, don't pick one
+
+This is the professionally correct move, not a compromise — report a **full-feature model** (with the caveat clearly stated: near-perfect score reflects the simulator's deterministic fault-effect formulas, not generalizable pattern learning) alongside a **sanitized model** using only features with genuine stochastic ambiguity. That's a stronger deliverable than picking either alone — it shows you can tell the difference between "the model is smart" and "the data made the target easy," which is a more valuable skill to demonstrate than a single clean number.
+
+## Code
+
+```python
+def train_mesh_fault_detector(ml_mesh_fault, concurrent_mesh_labels, train_end, val_end):
+    df = ml_mesh_fault.merge(concurrent_mesh_labels, on=["link_key", "timestamp"], how="left")
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = pd.get_dummies(df, columns=["link_type"], drop_first=True)
+
+    # Near-deterministic proxies of `intensity` — zero/near-zero noise in the generator,
+    # so these mechanically restate the fault rather than exhibit a learnable pattern.
+    deterministic_proxy_cols = ["packet_loss_mean_pct", "packet_loss_mean_4h",
+                                 "latency_mean_ms", "latency_mean_4h", "jitter_mean_ms", "availability_mean"]
+
+    all_features = [c for c in df.columns if c not in
+                     ["link_key", "timestamp", "source_agg_id", "target_agg_id", "is_currently_faulted"]]
+    sanitized_features = [c for c in all_features if c not in deterministic_proxy_cols]
+
+    train = df[df.timestamp <= train_end]
+    val = df[(df.timestamp > train_end) & (df.timestamp <= val_end)]
+
+    def fit_and_score(feature_list, label):
+        X_train, y_train = train[feature_list], train["is_currently_faulted"]
+        X_val, y_val = val[feature_list], val["is_currently_faulted"]
+        print(f"{label} — train faults: {y_train.sum()}, val faults: {y_val.sum()}")
+        if y_train.sum() == 0 or y_val.sum() == 0:
+            print(f"{label}: insufficient positives for a train/val split — skip modeling, report Cohen's d instead.")
+            return None
+        pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
+        model = XGBClassifier(scale_pos_weight=pos_weight, n_estimators=150, max_depth=4,
+                               learning_rate=0.03, min_child_weight=5, colsample_bytree=0.7,
+                               subsample=0.8, eval_metric="aucpr", random_state=42)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+        probs = model.predict_proba(X_val)[:, 1]
+        prauc = average_precision_score(y_val, probs)
+        print(f"{label} PR-AUC: {prauc:.4f} (base rate {y_val.mean():.4f}, "
+              f"lift {prauc / (y_val.mean() + 1e-5):.1f}x)")
+        return model, prauc
+
+    print("=== FULL-FEATURE MODEL (includes near-deterministic proxies — expect inflated score) ===")
+    full_result = fit_and_score(all_features, "Full-feature")
+
+    print("\n=== SANITIZED MODEL (behavioral/utilization signals only) ===")
+    sanitized_result = fit_and_score(sanitized_features, "Sanitized")
+
+    return full_result, sanitized_result
+
+
+full_result, sanitized_result = train_mesh_fault_detector(ml_mesh_fault, concurrent_mesh_labels,
+                                                           train_end="2025-03-04", val_end="2025-03-18")
+```
+
+## Core: still no train/val split — n=12 is the binding constraint, not feature choice
+
+The core problem here was never which split strategy to use — it's that 12 positive hours cannot support *any* held-out evaluation (temporal or random) with a trustworthy result. Report separation via Cohen's d on the full dataset instead, same discipline as the earlier cell-forecasting investigation:
+
+```python
+def audit_core_fault_separation(ml_core_fault):
+    ml_core_fault = ml_core_fault.copy()
+    ml_core_fault["is_currently_faulted"] = ml_core_fault["will_fault_next_4h"]
+
+    n_pos = ml_core_fault["is_currently_faulted"].sum()
+    print(f"Total positive core-fault hours: {n_pos} of {len(ml_core_fault)} "
+          f"({ml_core_fault['is_currently_faulted'].mean()*100:.4f}%)")
+    print("NOTE: too few positives for any train/val split (temporal OR random) to be "
+          "statistically meaningful — reporting full-dataset separation instead.\n")
+
+    feature_cols = ["cpu_mean_pct", "cpu_max_pct", "memory_mean_pct", "memory_max_pct",
+                     "session_failure_rate_mean", "alarm_count", "cpu_lag_1h", "cpu_mean_4h",
+                     "cpu_change_1h", "session_failure_mean_4h"]  # availability_mean excluded — same tautology risk
+
+    healthy = ml_core_fault[ml_core_fault.is_currently_faulted == 0]
+    faulty = ml_core_fault[ml_core_fault.is_currently_faulted == 1]
+
+    records = []
+    for col in feature_cols:
+        h, f = healthy[col].dropna(), faulty[col].dropna()
+        if len(f) == 0:
+            continue
+        pooled_std = np.sqrt(((len(h)-1)*h.std()**2 + (len(f)-1)*f.std()**2) / (len(h)+len(f)-2))
+        d = (f.mean() - h.mean()) / (pooled_std + 1e-5)
+        records.append({"feature": col, "healthy_mean": h.mean(), "faulty_mean": f.mean(), "cohens_d": d})
+
+    result = pd.DataFrame(records).sort_values("cohens_d", key=abs, ascending=False)
+    print(result.to_string(index=False))
+    return result
+
+core_separation = audit_core_fault_separation(ml_core_fault)
+```
+
+Report this table as-is with the explicit caveat that a Cohen's d, however large, is a **descriptive finding about separation**, not a validated predictive result — and note that this thin sample size is itself consistent with the earlier finding that core CPU never exceeded ~56% even during declared faults (i.e., core-layer degradation was deliberately made mild in the generator, so both the rarity and the weak separation are expected, not modeling failures).
+
+------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
+
+def audit_fault_magnitude(network_faults, ran_telemetry, transport_telemetry, core_telemetry,
+                           sites, cells, aggregations, core_deps_df, mesh_links):
+    metric_by_type = {
+        "ran_degradation":        ("sinr_db", ran_telemetry, "cell_id"),
+        "cell_outage":            ("availability_pct", ran_telemetry, "cell_id"),
+        "backhaul_degradation":   ("dl_throughput_mbps", ran_telemetry, "cell_id"),
+        "transport_link_failure": ("availability_pct", transport_telemetry, "link"),
+        "aggregation_failure":    ("availability_pct", ran_telemetry, "cell_id"),
+        "core_degradation":       ("cpu_utilization_pct", core_telemetry, "core_id"),
+    }
+    rows = []
+    for f in network_faults.itertuples():
+        if f.fault_type not in metric_by_type:
+            continue
+        metric, table, key_col = metric_by_type[f.fault_type]
+        scope = resolve_fault_scope(f, sites, cells, aggregations, core_deps_df, mesh_links)
+
+        if key_col == "cell_id":
+            entities = scope["cells"]
+            entity_rows = table[table.cell_id.isin(entities)]
+        elif key_col == "core_id":
+            entities = scope["cores"]
+            entity_rows = table[table.core_id.isin(entities)]
+        else:  # transport link: scope["mesh_links"] holds (source, target) tuples
+            entities = scope["mesh_links"]
+            entity_rows = table[table.apply(lambda r: (r.source_id, r.target_id) in entities or
+                                             (r.target_id, r.source_id) in entities, axis=1)]
+
+        if entity_rows.empty:
+            rows.append({"fault_id": f.fault_id, "fault_type": f.fault_type, "severity": f.severity,
+                         "metric": metric, "n_entities": len(entities), "before": None, "during": None, "delta": "NO SCOPE MATCH"})
+            continue
+
+        during = entity_rows[(entity_rows.timestamp >= f.start_time) & (entity_rows.timestamp <= f.end_time)]
+        before = entity_rows[entity_rows.timestamp < f.start_time]
+        during_mean = during.groupby("timestamp")[metric].mean().mean()
+        before_mean = before.groupby("timestamp")[metric].mean().tail(96).mean()
+
+        rows.append({"fault_id": f.fault_id, "fault_type": f.fault_type, "severity": f.severity,
+                     "metric": metric, "n_entities": len(entities),
+                     "before": round(before_mean, 2), "during": round(during_mean, 2),
+                     "delta": round(during_mean - before_mean, 2)})
+    return pd.DataFrame(rows)
+
+audit_fault_magnitude(network_faults, ran_telemetry, transport_telemetry, core_telemetry,
+                       sites, cells, aggregations, core_deps_df, mesh_links)
+------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
+
+Predictive Layer — Detailed Execution Guide
+Exact tables, exact columns, exact steps for each use case. Assumes every table from the build plan (ml_hourly_*, ml_entity_dependencies, ml_hourly_network_context, ml_cell_features, ml_cell_fault, ml_congestion_forecast, ml_anomaly_features, anomaly_scores, eval_*, anomaly_evaluation) already exists.
+
+Use Case 1 — Fault Prediction
+Primary table: ml_cell_fault
+Step 1 — Confirm the table's current shape before touching a model.
+
+print(ml_cell_fault.shape)
+print(ml_cell_fault.isna().sum().sort_values(ascending=False).head(15))
+print(ml_cell_fault["will_any_fault_next_4h"].value_counts(normalize=True))
+Expect NaNs concentrated in: sinr_slope_4h (needs 2+ points, so row 1 per cell), prb_lag_4h/sinr_change_4h/bler_change_4h (need 4 prior hours, so first 4 rows per cell), prb_std_4h (needs 2+ points). Expect the positive label rate to be a small single-digit percentage — if it's exactly 0% or above ~15%, stop and re-check resolve_fault_scope matching before proceeding.
+
+Step 2 — Drop the unusable warm-up rows.
+
+ml_cell_fault_clean = ml_cell_fault.dropna(
+    subset=["prb_lag_4h", "sinr_change_4h", "bler_change_4h", "sinr_slope_4h", "prb_std_4h"]
+).copy()
+This removes only the first ~4 hours per cell (unavoidable warm-up), not a meaningful fraction of the dataset.
+
+Step 3 — Explicitly separate features from labels/identifiers. This list is the actual training feature set — nothing else from the table should go into a model.
+
+feature_cols = [
+    "prb_util_mean", "traffic_mbps_mean", "sinr_mean", "bler_mean", "drop_rate_mean",
+    "availability_mean", "handover_success_mean",
+    "backhaul_util_mean", "core_uplink_util_mean", "core_util_mean",
+    "upstream_degraded", "upstream_down", "mesh_failover_active",
+    "prb_lag_1h", "prb_lag_4h", "sinr_lag_1h", "bler_lag_1h", "drop_rate_lag_1h",
+    "prb_mean_4h", "prb_std_4h", "sinr_mean_4h", "sinr_slope_4h",
+    "bler_mean_4h", "drop_rate_mean_4h", "availability_mean_4h",
+    "prb_change_1h", "sinr_change_4h", "bler_change_4h",
+    "alarm_count_trailing_24h", "hours_since_last_alarm",
+    "hour_of_day", "day_of_week", "is_weekend",
+    "technology", "band", "site_type", "region_name", "cell_capacity_mbps",
+]
+label_col = "will_any_fault_next_4h"
+id_cols = ["cell_id", "timestamp"]
+fault_type_if_any is never a feature — keep it attached to the dataframe for error analysis only, and exclude it from every model input.
+
+Step 4 — Encode categoricals.
+
+categorical_cols = ["technology", "band", "site_type", "region_name"]
+ml_cell_fault_encoded = pd.get_dummies(ml_cell_fault_clean, columns=categorical_cols, drop_first=True)
+feature_cols_encoded = [c for c in ml_cell_fault_encoded.columns
+                        if c not in id_cols + [label_col, "will_direct_fault_next_4h",
+                                                "will_cascaded_fault_next_4h", "fault_type_if_any"]]
+Step 5 — Temporal split.
+
+train, val, test = temporal_split(ml_cell_fault_encoded, timestamp_col="timestamp",
+                                   train_end="2025-03-04", val_end="2025-03-18", gap_days=1)
+# gap_days=1 is enough here — this table's longest window is 4h, not 7/14 days like congestion forecasting
+X_train, y_train = train[feature_cols_encoded], train[label_col]
+X_val, y_val = val[feature_cols_encoded], val[label_col]
+X_test, y_test = test[feature_cols_encoded], test[label_col]
+Step 6 — Baseline model first.
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import precision_recall_curve, average_precision_score, classification_report
+
+baseline = LogisticRegression(class_weight="balanced", max_iter=1000)
+baseline.fit(X_train, y_train)
+val_probs = baseline.predict_proba(X_val)[:, 1]
+print("Baseline PR-AUC:", average_precision_score(y_val, val_probs))
+If PR-AUC is barely above the positive rate itself (i.e., no better than guessing "always positive" at the base rate), the signal may be weaker than expected — investigate before adding model complexity.
+
+Step 7 — Stronger model.
+
+from xgboost import XGBClassifier
+pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
+model = XGBClassifier(scale_pos_weight=pos_weight, n_estimators=300, max_depth=5,
+                       learning_rate=0.05, eval_metric="aucpr")
+model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+Step 8 — Pick an operating threshold from precision-recall, not 0.5 by default.
+
+precisions, recalls, thresholds = precision_recall_curve(y_val, model.predict_proba(X_val)[:, 1])
+# choose the threshold that hits a recall/precision trade-off appropriate to NOC capacity
+# e.g. the smallest threshold achieving recall >= 0.7
+Step 9 — Final test evaluation at the chosen threshold, report precision/recall/F1 and the confusion matrix — never accuracy alone.
+
+Step 10 — SHAP.
+
+import shap
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(X_test)
+shap.summary_plot(shap_values, X_test)
+Confirm the top features are radio-quality/utilization trend features, not hour_of_day/day_of_week dominating — if calendar features rank highest, that's a sign the model is learning a diurnal proxy rather than genuine fault precursors.
+
+Step 11 — Extend to other entity types, only after steps 1–10 pass on cells:
+
+def build_ml_mesh_fault(ml_hourly_mesh, network_faults, sites, cells, aggregations, core_deps_df, mesh_links, horizon_hours=4):
+    df = ml_hourly_mesh.copy()
+    df["link_key"] = list(zip(df.source_agg_id, df.target_agg_id))
+    df = df.sort_values(["link_key", "timestamp"]).reset_index(drop=True)
+    g = df.groupby("link_key")
+
+    df["util_lag_1h"] = g["utilization_mean"].shift(1)
+    df["util_mean_4h"] = g["utilization_mean"].transform(lambda s: s.rolling(4, min_periods=1).mean())
+    df["util_change_1h"] = df["utilization_mean"] - df["util_lag_1h"]
+    df["latency_mean_4h"] = g["latency_mean_ms"].transform(lambda s: s.rolling(4, min_periods=1).mean())
+    df["packet_loss_mean_4h"] = g["packet_loss_mean_pct"].transform(lambda s: s.rolling(4, min_periods=1).mean())
+    df["hour_of_day"] = df["timestamp"].dt.hour
+    df["day_of_week"] = df["timestamp"].dt.dayofweek
+    df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
+
+    labels = []
+    for key, group in df.groupby("link_key"):
+        pair = key
+        matching_faults = network_faults[network_faults.fault_type == "transport_link_failure"]
+        starts = [f.start_time for f in matching_faults.itertuples()
+                  if (f.link_source_id, f.link_target_id) == pair or (f.link_target_id, f.link_source_id) == pair]
+        for t in group["timestamp"]:
+            window_end = t + pd.Timedelta(hours=horizon_hours)
+            labels.append(int(any(t < s <= window_end for s in starts)))
+    df["will_fault_next_4h"] = labels
+    return df
+
+ml_mesh_fault = build_ml_mesh_fault(ml_hourly_mesh, network_faults, sites, cells, aggregations, core_deps_df, mesh_links)
+def build_ml_core_fault(ml_hourly_core, network_faults, sites, cells, aggregations, core_deps_df, mesh_links, horizon_hours=4):
+    df = ml_hourly_core.sort_values(["core_id", "timestamp"]).reset_index(drop=True)
+    g = df.groupby("core_id")
+
+    df["cpu_lag_1h"] = g["cpu_mean_pct"].shift(1)
+    df["cpu_mean_4h"] = g["cpu_mean_pct"].transform(lambda s: s.rolling(4, min_periods=1).mean())
+    df["cpu_change_1h"] = df["cpu_mean_pct"] - df["cpu_lag_1h"]
+    df["session_failure_mean_4h"] = g["session_failure_rate_mean"].transform(lambda s: s.rolling(4, min_periods=1).mean())
+    df["hour_of_day"] = df["timestamp"].dt.hour
+    df["day_of_week"] = df["timestamp"].dt.dayofweek
+    df["is_weekend"] = (df["day_of_week"] >= 5).astype(int)
+
+    labels = []
+    for core_id, group in df.groupby("core_id"):
+        matching_faults = network_faults[(network_faults.fault_type == "core_degradation") &
+                                          (network_faults.entity_id == core_id)]
+        starts = matching_faults.start_time.tolist()
+        for t in group["timestamp"]:
+            window_end = t + pd.Timedelta(hours=horizon_hours)
+            labels.append(int(any(t < s <= window_end for s in starts)))
+    df["will_fault_next_4h"] = labels
+    return df
+
+ml_core_fault = build_ml_core_fault(ml_hourly_core, network_faults, sites, cells, aggregations, core_deps_df, mesh_links)
+Note: given the earlier finding that core_resource_exhaustion alarms never fired in your frozen dataset (max CPU during faults stayed ~47–56%), expect ml_core_fault's positive examples to still exist (fault windows are still labeled from network_faults directly, independent of whether an alarm fired) but the CPU-based features may show weaker separation than the cell model's SINR/BLER features — worth reporting as a finding, not a bug.
+
+Use Case 2 — Congestion Forecasting
+Primary table: ml_congestion_forecast
+Step 1 — Confirm shape and check label NaNs.
+
+print(ml_congestion_forecast[["prb_t_plus_1h", "prb_t_plus_6h", "prb_t_plus_24h"]].isna().sum())
+Expect NaNs only in the last 1/6/24 rows per cell respectively (from the negative shift) — this is expected, not a bug.
+
+Step 2 — Build one clean dataset per horizon (never share rows with a different horizon's target as a feature):
+
+def prep_horizon_dataset(df, horizon_label_col, drop_other_targets):
+    clean = df.dropna(subset=[horizon_label_col, "prb_lag_168h", "prb_slope_7d"]).copy()
+    clean = clean.drop(columns=drop_other_targets)
+    return clean
+
+targets = ["prb_t_plus_1h", "prb_t_plus_6h", "prb_t_plus_24h"]
+ds_1h = prep_horizon_dataset(ml_congestion_forecast, "prb_t_plus_1h", [t for t in targets if t != "prb_t_plus_1h"])
+ds_6h = prep_horizon_dataset(ml_congestion_forecast, "prb_t_plus_6h", [t for t in targets if t != "prb_t_plus_6h"])
+ds_24h = prep_horizon_dataset(ml_congestion_forecast, "prb_t_plus_24h", [t for t in targets if t != "prb_t_plus_24h"])
+dropna(subset=["prb_lag_168h", ...]) also removes the first 7–14 days per cell where lag/slope features aren't yet available — expected.
+
+Step 3 — Feature list per horizon dataset (identical set regardless of horizon; only the target and the dropped sibling-targets differ):
+
+congestion_feature_cols = [
+    "prb_util_t", "traffic_t", "capacity_headroom_current",
+    "prb_lag_1h", "prb_lag_2h", "prb_lag_24h", "prb_lag_168h",
+    "traffic_lag_1h", "traffic_lag_24h",
+    "prb_mean_24h", "prb_std_24h", "prb_mean_7d", "prb_slope_7d",
+    "traffic_mean_24h", "traffic_slope_7d",
+    "hour_of_day", "day_of_week", "is_weekend",
+    "technology", "region_name", "site_type", "cell_capacity_mbps", "is_watch_band_cell",
+]
+Step 4 — Temporal split, trimmed at BOTH ends of each segment — this use case's labels look forward, so the split needs a trailing trim too, not just a leading gap:
+
+def temporal_split_forward_labels(df, timestamp_col, train_end, val_end, gap_days, horizon_hours):
+    train, val, test = temporal_split(df, timestamp_col, train_end, val_end, gap_days)
+    # additionally drop rows within `horizon_hours` of each segment's own end,
+    # since their label technically depends on data at/after that segment's boundary
+    cutoff = pd.Timedelta(hours=horizon_hours)
+    train = train[train[timestamp_col] <= train[timestamp_col].max() - cutoff]
+    val = val[val[timestamp_col] <= val[timestamp_col].max() - cutoff]
+    return train, val, test
+
+train_1h, val_1h, test_1h = temporal_split_forward_labels(ds_1h, "timestamp", "2025-03-04", "2025-03-18", 7, 1)
+train_24h, val_24h, test_24h = temporal_split_forward_labels(ds_24h, "timestamp", "2025-03-04", "2025-03-18", 14, 24)
+Step 5 — Naive baseline before any model.
+
+naive_pred = val_1h["prb_lag_168h"]  # "same hour last week"
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+print("Naive MAE:", mean_absolute_error(val_1h["prb_t_plus_1h"], naive_pred))
+Step 6 — Train a model (e.g. LightGBM/XGBoost regressor) per horizon, report MAE/RMSE and % improvement over the naive baseline computed in Step 5 — this ratio is the number that actually justifies the model's existence.
+
+Step 7 — Segmented evaluation.
+
+for flag_val, label in [(1, "Watch-band cells"), (0, "Normal cells")]:
+    subset = test_1h[test_1h.is_watch_band_cell == flag_val]
+    preds = model.predict(subset[congestion_feature_cols_encoded])
+    print(label, "MAE:", mean_absolute_error(subset["prb_t_plus_1h"], preds))
+Report both numbers — a large gap tells you the model handles stable and volatile cells very differently, which is a genuine finding for the writeup.
+
+Use Case 3 — Anomaly Detection
+Tables: ml_anomaly_features → anomaly_scores → anomaly_evaluation
+Step 1 — Exclude cold-start rows before evaluating anything.
+
+cold_start_cutoff = ml_anomaly_features["timestamp"].min() + pd.Timedelta(weeks=4)
+anomaly_evaluation_valid = anomaly_evaluation[anomaly_evaluation["timestamp"] >= cold_start_cutoff].copy()
+Step 2 — Sweep threshold/persistence combinations, not one fixed guess.
+
+results = []
+for z_thr in [2.0, 2.5, 3.0]:
+    for persist in [1, 2, 3]:
+        scores = build_anomaly_scores(ml_anomaly_features, z_threshold=z_thr, persistence_hours=persist)
+        evald = build_anomaly_evaluation(scores, eval_fault_events, eval_congestion_events, eval_data_anomalies)
+        evald = evald[evald["timestamp"] >= cold_start_cutoff]
+        detection_rate = evald.loc[evald.ground_truth_category != "none", "is_anomaly_flagged"].mean()
+        false_positive_rate = evald.loc[evald.ground_truth_category == "none", "is_anomaly_flagged"].mean()
+        results.append({"z_threshold": z_thr, "persistence": persist,
+                         "detection_rate": detection_rate, "false_positive_rate": false_positive_rate})
+pd.DataFrame(results).sort_values("detection_rate", ascending=False)
+Pick the combination with the best detection-rate/false-positive-rate trade-off — there is no universally correct threshold, it depends on how much noise is tolerable.
+
+Step 3 — Build the three-way confusion matrix at your chosen threshold — this is the headline deliverable.
+
+pd.crosstab(anomaly_evaluation_valid["ground_truth_category"], anomaly_evaluation_valid["is_anomaly_flagged"],
+            normalize="index")
+Read this row by row: for fault rows, what fraction got flagged (should be high — faults are usually large deviations); for congestion rows, what fraction got flagged (may be lower, since congestion events were built as smooth ramps, not sharp spikes — a genuine, reportable limitation of a z-score-based detector); for data_anomaly rows, what fraction got flagged (should be reasonably high — these are deliberately sharp, brief spikes, which is exactly what z-scores are good at catching); for none rows, what fraction got falsely flagged (your false-positive rate).
+
+Step 4 — Break the confusion matrix down by metric_name to see which metric is doing the actual detection work:
+
+pd.crosstab([anomaly_evaluation_valid["metric_name"], anomaly_evaluation_valid["ground_truth_category"]],
+            anomaly_evaluation_valid["is_anomaly_flagged"], normalize="index")
+This tells you, for example, whether prb_util_mean_zscore catches congestion better than sinr_mean_zscore does — a genuinely useful, specific finding rather than a single blended detection rate.
+
+Step 5 — Write up the result honestly, including where the detector underperforms (likely congestion, per Step 3's expected pattern) — this is more credible and more interesting than reporting only a single aggregate accuracy number, and it directly demonstrates that the three-way causal separation built into the simulator from the very first design session actually produces a measurable, non-trivial distinction.
+------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------
+
+Predictive Layer — Final Table Plan
+This is the complete build plan for the three predictive use cases: Fault Prediction, Congestion Forecasting, and Anomaly Detection. It specifies every intermediate and final table, exactly which raw table(s) each column comes from, and the order to build everything in.
+
+0. Ground rules (apply to every table below)
+Feature grain is hourly, not 15-minute. Every "hourly" table below is a rollup of the corresponding raw 15-minute telemetry table.
+No feature at time t may use data from after t. Rolling windows are always trailing (t-N to t), never centered or forward-looking.
+Hidden ground-truth tables (network_faults, data_anomalies, congestion_events) are touched exactly once each, only to build a label/eval table. They are never joined into a feature table.
+Split by time, not randomly: e.g. days 1–63 train, 64–77 validation, 78–90 test, with a gap between splits at least as long as your longest rolling window (7 days) so no window straddles a split boundary.
+Build in layers, checkpointing after each: raw → hourly → topology join → cross-layer context → feature base → per-use-case final tables → labels/eval. Inspect each layer's output before moving to the next.
+1. Hourly Rollup Tables (Layer 1)
+Built directly from raw 15-minute telemetry. One row per entity per hour.
+
+ml_hourly_ran
+Grain: cell × hour · Source: ran_telemetry, static context from cells/sites/regions
+
+Column	Derivation
+timestamp	Hour bucket (floor(timestamp, '1H'))
+cell_id	From ran_telemetry
+site_id, aggregation_id, region_name, technology, band, sector, site_type, latitude, longitude, cell_capacity_mbps	Joined from cells/sites/regions (static, doesn't change by hour)
+traffic_mbps_mean/max	AVG/MAX of dl_throughput_mbps + ul_throughput_mbps from ran_telemetry
+prb_util_mean/max	AVG/MAX of prb_utilization_pct
+throughput_mbps_mean	AVG of dl_throughput_mbps + ul_throughput_mbps
+sinr_mean/min	AVG/MIN of sinr_db
+rsrp_mean, rsrq_mean	AVG of rsrp_dbm, rsrq_db
+bler_mean/max	AVG/MAX of bler_pct
+rrc_success_mean, erab_success_mean	AVG of rrc_setup_success_pct, erab_setup_success_pct
+drop_rate_mean	AVG of drop_rate_pct
+handover_success_mean	AVG of handover_success_pct
+availability_mean	AVG of availability_pct
+alarm_count	COUNT of rows in network_alarms where entity_type='ran', entity_id=cell_id, in this hour
+ml_hourly_backhaul
+Grain: site × hour · Source: transport_telemetry filtered to link_type='backhaul', static from backhaul_links
+
+Column	Derivation
+timestamp, site_id	From transport_telemetry.source_id (site is always source on a backhaul link)
+aggregation_id	From transport_telemetry.target_id
+distance_km, capacity_gbps	Static, from backhaul_links
+utilization_mean/max	AVG/MAX of utilization_pct
+latency_mean_ms, jitter_mean_ms, packet_loss_mean_pct	AVG of respective columns
+availability_mean	AVG of availability_pct
+link_status_mode	Most frequent link_status value that hour (UP/DEGRADED/DOWN)
+ml_hourly_mesh
+Grain: mesh link × hour · Source: transport_telemetry filtered to link_type IN ('fiber_metro','fiber_regional','microwave'), static from mesh_links
+
+Column	Derivation
+timestamp, source_agg_id, target_agg_id, link_type, distance_km, capacity_gbps	From transport_telemetry + static mesh_links
+utilization_mean/max, latency_mean_ms, jitter_mean_ms, packet_loss_mean_pct, availability_mean, link_status_mode	Same aggregation pattern as backhaul
+ml_hourly_core_uplink
+Grain: aggregation × hour · Source: transport_telemetry filtered to link_type='core_uplink', static from core_deps_df
+
+Column	Derivation
+timestamp, aggregation_id (=source_id), core_id (=target_id), dependency_role	From transport_telemetry + core_deps_df (role = primary/secondary)
+utilization_mean/max, latency_mean_ms, packet_loss_mean_pct, availability_mean	Same aggregation pattern
+ml_hourly_core
+Grain: core × hour · Source: core_telemetry
+
+Column	Derivation
+timestamp, core_id	From core_telemetry
+cpu_mean_pct/max_pct	AVG/MAX of cpu_utilization_pct
+memory_mean_pct/max_pct	AVG/MAX of memory_utilization_pct
+session_failure_rate_mean	AVG of session_failure_rate_pct
+availability_mean	AVG of availability_pct
+alarm_count	COUNT from network_alarms where entity_type='core', this hour
+Note: ml_hourly_backhaul and ml_hourly_mesh are kept separate — they are structurally different link types (site→aggregation vs. aggregation↔aggregation) and, per the network design, carry traffic under different conditions (backhaul always active; mesh only carries meaningful load during failover). Do not merge them into one "transport" table.
+
+2. Topology Join Map (Layer 2)
+ml_entity_dependencies
+Grain: one row per cell · Source: cells, sites, backhaul_links, core_deps_df — built entirely from static topology, no telemetry
+
+Column	Derivation
+cell_id, site_id	From cells
+aggregation_id	From sites.aggregation_id
+primary_core_id, secondary_core_id	From core_deps_df, filtered to dependency_role='primary'/'secondary' for this aggregation_id
+This table has no time dimension — it's a static lookup, rebuilt only if topology changes.
+
+3. Cross-Layer Context (Layer 3)
+ml_hourly_network_context
+Grain: cell × hour · Source: ml_hourly_backhaul, ml_hourly_mesh, ml_hourly_core_uplink, ml_hourly_core, joined via ml_entity_dependencies
+
+Column	Derivation
+timestamp, cell_id	Identifiers
+backhaul_util_mean/max	From ml_hourly_backhaul, joined on this cell's site_id
+backhaul_latency_mean, backhaul_packet_loss_mean	Same join
+core_uplink_util_mean/max	From ml_hourly_core_uplink joined on aggregation_id + dependency_role='primary' — this is the normal-path transport signal, always relevant
+mesh_failover_active	1 if this aggregation's rows appear as source_agg_id/target_agg_id with utilization_mean > 0 in ml_hourly_mesh this hour (i.e. genuinely carrying traffic, not idle baseline) — see §note below
+mesh_util_mean	From ml_hourly_mesh, only meaningful when mesh_failover_active=1; else null/0
+core_util_mean/max, core_session_failure_mean	From ml_hourly_core, joined via primary_core_id
+upstream_degraded	1 if any of: backhaul_util_mean > 90, core_uplink_util_mean > 90, core_util_mean (cpu) > 85
+upstream_down	1 if backhaul_availability_mean < 50 OR core_uplink_availability_mean < 50 OR core_availability_mean < 50
+Note on mesh_failover_active: the mesh only carries load during a failover scenario (per the transport design — normal traffic goes aggregation→core directly). A non-zero utilization_mean on a mesh link this hour is itself evidence a failover is in progress; don't infer this from network_faults (that would be leakage) — derive it purely from observed mesh utilization crossing a small non-zero threshold (e.g. > 0.5 Gbps).
+
+4. Shared Feature Base (Layer 4)
+ml_cell_features
+Grain: cell × hour · Source: ml_hourly_ran + ml_hourly_network_context, joined on cell_id, timestamp
+
+All columns from both tables above, unioned into one row per cell-hour. This is the base every downstream feature table starts from — no new derivation here, just the join.
+
+5. Use Case 1 — Fault Prediction
+Build one table per entity type. Start with ml_cell_fault; extend the same pattern to site/aggregation/mesh/core once validated.
+
+ml_cell_fault
+Grain: cell × hour · Source: ml_cell_features (current state) + itself lagged (temporal features) + network_faults (labels only)
+
+Current state (direct copy from ml_cell_features at time t): prb_util_mean, traffic_mbps_mean, throughput_mbps_mean, sinr_mean, bler_mean, drop_rate_mean, availability_mean, handover_success_mean, backhaul_util_mean, core_uplink_util_mean, core_util_mean, upstream_degraded, upstream_down, mesh_failover_active
+
+Lag features (value at t-N): prb_lag_1h, prb_lag_4h, sinr_lag_1h, bler_lag_1h, drop_rate_lag_1h
+
+Trailing rolling features (window ending at t, never including t+): prb_mean_4h, prb_std_4h, sinr_mean_4h, sinr_slope_4h (linear regression slope of SINR over trailing 4h — captures a developing decline, not just level), bler_mean_4h, drop_rate_mean_4h, availability_mean_4h
+
+Delta features: prb_change_1h = prb_util_mean[t] - prb_util_mean[t-1h] sinr_change_4h = sinr_mean[t] - sinr_mean[t-4h] bler_change_4h = bler_mean[t] - bler_mean[t-4h]
+
+Alarm history: alarm_count_trailing_24h (sum of ml_hourly_ran.alarm_count over trailing 24h), hours_since_last_alarm
+
+Calendar: hour_of_day, day_of_week, is_weekend
+
+Static: technology, band, site_type, region_name, cell_capacity_mbps
+
+Labels (built from network_faults via resolve_fault_scope — never used as features):
+
+Column	Meaning
+will_direct_fault_next_4h	1 if a fault whose entity_id IS this cell (ran_degradation, cell_outage) starts in (t, t+4h]
+will_cascaded_fault_next_4h	1 if this cell falls in resolve_fault_scope of an aggregation_failure/core_degradation/backhaul_degradation fault starting in (t, t+4h]
+will_any_fault_next_4h	will_direct_fault_next_4h OR will_cascaded_fault_next_4h — primary training target
+fault_type_if_any	For error analysis only — never a feature
+ml_mesh_fault, ml_core_fault, ml_aggregation_fault
+Same pattern as ml_cell_fault, built from ml_hourly_mesh/ml_hourly_core/aggregation-level rollup respectively, with entity-appropriate current-state/lag/rolling columns (e.g. ml_core_fault uses cpu_mean_pct, session_failure_rate_mean instead of SINR/BLER). Build after ml_cell_fault is validated.
+
+6. Use Case 2 — Congestion Forecasting
+ml_congestion_forecast
+Grain: cell × hour · Source: ml_cell_features (current + lagged) — labels are the entity's own future value, not from any hidden table
+
+Lags: prb_lag_1h, prb_lag_2h, prb_lag_24h (same hour yesterday), prb_lag_168h (same hour last week), traffic_lag_1h, traffic_lag_24h
+
+Rolling: prb_mean_24h, prb_std_24h, prb_mean_7d, prb_slope_7d (14-day trend, captures the generator's long-term drift), traffic_mean_24h, traffic_slope_7d
+
+Current state: prb_util_t, traffic_t, capacity_headroom_current = cell_capacity_mbps - traffic_t
+
+Calendar: hour_of_day, day_of_week, is_weekend
+
+Static: technology, region_name, site_type, cell_capacity_mbps, is_watch_band_cell (flag from the design-time watch_utilization_override assignment — lets you evaluate forecast accuracy separately for persistently-high-utilization cells vs. normal ones)
+
+Labels (the cell's own actual future value — no hidden table involved): prb_t_plus_1h, prb_t_plus_6h, prb_t_plus_24h — train one model per horizon; never include a different horizon's target as a feature for another model.
+
+7. Use Case 3 — Anomaly Detection
+ml_anomaly_features
+Grain: cell × hour · Source: ml_cell_features + a seasonal baseline computed from the entity's own history
+
+For each of prb_util_mean, traffic_mbps_mean, throughput_mbps_mean, sinr_mean, bler_mean:
+
+{metric}_expected — trailing seasonal baseline (e.g. mean of this cell's own value at the same hour-of-day/day-of-week over prior weeks, or an exponentially weighted trailing average)
+{metric}_residual = actual - expected
+{metric}_zscore = residual / rolling_std_of_residual
+anomaly_scores (detector output, not a feature table)
+Grain: cell × hour — entity_id, timestamp, metric_name, actual_value, expected_value, residual, z_score, is_anomaly_flagged (1 if |z_score| exceeds threshold for ≥2 consecutive hours)
+
+8. Evaluation / Ground-Truth Tables (never joined into features)
+eval_fault_events
+From network_faults + resolve_fault_scope: entity_id, entity_type, fault_id, fault_type, severity, start_time, end_time
+
+eval_congestion_events
+From congestion_events directly (matches its real schema — no invented severity field): congestion_id, site_id, start_time, end_time, peak_multiplier, design_util_baseline
+
+eval_data_anomalies
+From data_anomalies directly: anomaly_id, cell_id, start_time, end_time, multiplier
+
+anomaly_evaluation (three-way scoring harness)
+Grain: cell × hour — joins anomaly_scores.is_anomaly_flagged against all three eval tables above via time-window membership, producing ground_truth_fault, ground_truth_congestion, ground_truth_data_anomaly, ground_truth_category (priority-ordered if windows overlap: fault > congestion > anomaly — document this tie-break), and detector_correct. This is where you produce the three-way confusion matrix showing whether the detector (and, later, which features) actually distinguish the three phenomena or just flag "something's unusual" indiscriminately.
+
+9. Build Order
+ml_hourly_ran, ml_hourly_backhaul, ml_hourly_mesh, ml_hourly_core_uplink, ml_hourly_core — validate row counts and spot-check a few entities against raw telemetry before proceeding.
+ml_entity_dependencies — validate every cell resolves to exactly one site/aggregation/primary core/secondary core, no orphans.
+ml_hourly_network_context — validate mesh_failover_active actually turns on during known fault windows that force failover (cross-check a couple manually against network_faults).
+ml_cell_features — row count should equal n_cells × n_hours exactly; check for unexpected nulls.
+Fault labels (will_direct_fault_next_4h etc.) — validate against the same fault-magnitude style audit used earlier in this project (does the positive-label rate roughly match expected fault-affected hours from network_faults).
+ml_cell_fault full feature set — check no column reads data from t+.
+ml_congestion_forecast — validate lag/rolling columns manually on 2–3 cells against the raw hourly series.
+ml_anomaly_features + anomaly_scores + anomaly_evaluation — build last, since it depends on having validated rolling/seasonal logic already proven correct in steps 6–7.
+Apply the temporal train/val/test split only after all tables are built and validated — splitting early risks accidentally computing a rolling window across the boundary during debugging.
+Do not skip the per-layer validation steps — every earlier stage of this project (topology, capacity, telemetry) turned up a real bug exactly when a layer was trusted without checking it first.

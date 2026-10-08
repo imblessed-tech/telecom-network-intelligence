@@ -1,0 +1,192 @@
+Build Guide — Telecom Network Intelligence Project (VS Code, start to finish)
+This is the consolidated reference. Every function named below was already written and validated earlier in this project's chat history — this guide's job is to tell you exactly which file each one goes into and the order to build and test things in, so you're assembling a known-working system rather than guessing. Where a file is brand-new (not written before), full code is included.
+
+Work through this phase by phase, testing after each phase — don't write all the files first and test at the end. Every earlier bug in this project (stale tables, mismatched joins, silent row-count changes) was caught specifically because each layer was validated before the next was built on top of it. Same discipline applies here.
+
+Phase 0 — Scaffolding
+Open a terminal in VS Code and run:
+
+mkdir telecom-network-intelligence && cd telecom-network-intelligence
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+
+mkdir -p simulator ml_pipeline artifacts api/routers api/core scripts notebooks tests
+mkdir -p data/raw data/hourly data/ml
+
+touch simulator/__init__.py ml_pipeline/__init__.py api/__init__.py api/routers/__init__.py
+touch simulator/topology.py simulator/capacity.py simulator/operational.py
+touch ml_pipeline/config.py ml_pipeline/features.py ml_pipeline/labels.py ml_pipeline/train.py
+touch api/main.py api/dependencies.py api/schemas.py
+touch api/routers/health.py api/routers/fault_detection.py api/routers/congestion.py api/routers/anomaly.py
+touch scripts/run_full_pipeline.py
+touch requirements.txt render.yaml .gitignore README.md
+
+git init
+Create requirements.txt and install:
+
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+pandas==2.2.2
+numpy==1.26.4
+scipy==1.13.0
+scikit-learn==1.5.0
+xgboost==2.0.3
+shap==0.45.1
+joblib==1.4.2
+pydantic==2.7.1
+pyarrow==16.1.0
+networkx==3.3
+k-means-constrained==0.7.3
+pip install -r requirements.txt
+Create .gitignore:
+
+data/
+__pycache__/
+*.pyc
+.env
+venv/
+Phase 1 — simulator/topology.py
+Purpose: all static network generation — regions, sites, cells, aggregation nodes, transport mesh, core nodes, and the unified topology table.
+
+Function inventory — search the chat for these exact names and paste them in, in this order:
+
+Order	Function	What it does
+1	factor_lookup	Converts qualitative region factors to numeric scores
+2	create_regions	Builds the regions table
+3	create_sites	Allocates sites to regions
+4	assign_site_coordinates	Lat/lon via region anchors + spread (use the widened REGION_ANCHORS/REGION_SPREAD_DEG from the geography-fix round, not the original narrow ones)
+5	assign_site_type	urban/suburban/rural classification
+6	create_cells	Cell generation per site
+7	assign_sector_and_band	Sector cycling + band assignment
+8	assign_baseline_heterogeneity	Per-cell quality offset + Watch-band override (from the heterogeneity round)
+9	assign_cell_capacity	cell_capacity_mbps from (technology, band)
+10	haversine_km	Distance helper — used everywhere below
+11	assign_aggregation_nodes + create_aggregation_nodes	K-means-constrained clustering
+12	add_region_demand_multiplier + compute_design_load	Demand derivation (the corrected version with demand_variation_factor/watch_utilization_override folded in)
+13	assign_aggregation_capacity	Aggregation capacity sizing
+14	build_backhaul_links	Site→aggregation links (the version with headroom_factor=1.5, min_capacity_gbps floor)
+15	build_transport_mesh	Kruskal MST + redundancy augmentation
+16	classify_medium + size_transport_mesh	Mesh link sizing from failover routing (the routed-load version using compute_mesh_failover_load, not the early heuristic)
+17	compute_mesh_failover_load	Shortest-path failover load calculation
+18	create_core_nodes	Core node placement (off-anchor coordinates)
+19	assign_core_dependencies	Primary/secondary core assignment
+20	assign_core_capacity	Core capacity from primary+secondary load
+21	build_transport_links_table + build_topology_table	Final unified tables
+22	validate_topology	Connectivity/failover sanity checks
+Constants to paste at the top of the file: NETWORK_CONFIG, REGION_INFO, REGION_ANCHORS (widened version), REGION_SPREAD_DEG (widened version), CORE_ANCHORS.
+
+Test before moving on:
+
+# in a scratch cell or tests/test_topology_smoke.py
+import numpy as np
+rng = np.random.default_rng(42)
+regions = create_regions(REGION_INFO, 50)
+sites = create_sites(regions)
+sites = assign_site_coordinates(sites, regions, rng=rng)
+sites = assign_site_type(sites, regions)
+cells = create_cells(regions, sites, rng)
+cells = assign_sector_and_band(cells, rng)
+cells = assign_baseline_heterogeneity(cells, rng)
+cells = assign_cell_capacity(cells)
+assert len(sites) == 50 and cells.cell_id.is_unique
+print("Phase 1 topology OK:", sites.shape, cells.shape)
+Phase 2 — simulator/capacity.py
+Function inventory:
+
+Function	Notes
+audit_capacity_chain	The full-chain utilization audit — run after every regeneration
+_flag_outliers	Helper used inside the audit
+Test: run audit_capacity_chain(...) on Phase 1's output and confirm aggregation utilization lands ~70-75%, no undercapacity beyond the one known thin microwave link, no core LOW/HIGH flags beyond what was previously explained (core provisioned for failover).
+
+Phase 3 — simulator/operational.py
+Purpose: 90 days of telemetry, faults, alarms, anomalies, congestion.
+
+Constants: TIME_CONFIG, N_STEPS, SEVERITY_LEVELS, SEVERITY_WEIGHTS, FAULT_TYPE_CONFIG, LINK_PROFILES, RADIO_BASELINE_SINR, MBPS_PER_ACTIVE_USER, ALARM_RULES, FALSE_ALARM_RATE, TRANSPORT_MEDIUM_PROFILES (if not already in topology.py).
+
+Function inventory, in build order:
+
+Order	Function	Notes
+1	build_time_index	90-day hourly/15-min index
+2	diurnal_curve	Region/site-type-shaped daily curve
+3	generate_traffic_demand	Cell-level demand
+4	inject_anomalies	Short demand spikes (hidden truth)
+5	generate_congestion_events + apply_congestion_to_demand	Use the retargeted version — sites pre-selected by design-time utilization band, not random
+6	build_neighbor_map	Nearest-cell lookup for handover
+7	generate_network_faults	Use the version with link_source_id/link_target_id split columns, not a tuple entity_id
+8	fault_intensity	Ramp-plateau-ramp shape
+9	resolve_fault_scope	Topology-driven fault scope — used everywhere downstream
+10	generate_ran_telemetry	Use the two-pass version (intrinsic quality pass, then handover pass using real neighbor SINR)
+11	compute_hierarchy_loads	Rolls cell traffic up to site/aggregation/core
+12	build_link_load_lookup + generate_link_telemetry + generate_transport_telemetry	Transport telemetry, all three link types
+13	generate_core_telemetry	Core telemetry
+14	generate_alarms	Use the hysteresis version (fire_with_hysteresis, breach/clear thresholds), not the plain persistence-only version
+15	fire_with_hysteresis	Hysteresis helper
+16	build_evaluation_labels	Cell-level fault label table (hidden truth)
+17	build_eval_fault_events, eval_congestion_events/eval_data_anomalies (direct copies)	Ground-truth tables for the anomaly evaluation harness
+Test: generate the full 90 days on the Phase 1/2 output, then run:
+
+audit_fault_magnitude(network_faults, ran_telemetry, transport_telemetry, core_telemetry,
+                       sites, cells, aggregations, core_deps_df, mesh_links)
+All 6 fault types should show correct-direction deltas, zero misses.
+
+Phase 4 — ml_pipeline/config.py, features.py, train.py
+These three files were given in full, ready to paste, in the previous message of this conversation (the one that produced the full FastAPI project). Copy them exactly as written there — no changes needed unless you want to adjust feature lists.
+
+Also add (referenced but not yet placed in a file): build_batch_cell_fault_features belongs in ml_pipeline/features.py (it's the batch/training-time counterpart to compute_live_cell_fault_features, both already in that file per the previous message).
+
+ml_pipeline/labels.py — paste build_fault_labels_for_cells here (written during the Use Case 1 detailed guide).
+
+Test:
+
+from ml_pipeline.features import build_batch_cell_fault_features
+ml_cell_fault_features = build_batch_cell_fault_features(ml_hourly_ran)
+print(ml_cell_fault_features.isna().sum().sort_values(ascending=False).head())
+Expect NaNs only in the first ~4 warm-up hours per cell.
+
+Phase 5 — scripts/run_full_pipeline.py
+Given in full in the previous message. Paste as-is, then fill in the two # (abbreviated here...) sections in run_ml_tables/run_training using the functions from Phase 4 plus train_cell_fault_model/train_congestion_models/build_anomaly_baselines from ml_pipeline/train.py.
+
+Run it:
+
+python -m scripts.run_full_pipeline
+This is the single command that takes a fresh clone to a fully populated artifacts/ folder. Expect this to take a while (telemetry generation is the slow stage) — that's why every stage checkpoints to data/ and skips on rerun unless --force is passed.
+
+Verify artifacts/ now contains:
+
+cell_fault_model.joblib
+shap_explainer_cell_fault.joblib
+cell_fault_schema.json
+cell_fault_metadata.json
+congestion_model_1h.joblib / _6h.joblib / _24h.joblib
+congestion_schema.json
+congestion_metadata.json
+anomaly_baselines.parquet
+Phase 6 — api/schemas.py, dependencies.py, main.py, routers/*
+All given in full in the previous message — paste exactly as written. This phase has no dependency on simulator/ at all; it only reads artifacts/.
+
+Test locally:
+
+uvicorn api.main:app --reload
+Open http://127.0.0.1:8000/docs — FastAPI's auto-generated Swagger UI. Test each endpoint there directly:
+
+GET /health — confirm status: ok and all artifact flags true.
+POST /predict/fault/cell — paste 5+ real hourly rows for one cell from data/hourly/ml_hourly_ran.parquet (pick any cell_id, its last 5-10 rows) as the request body.
+POST /predict/fault/cell/explain — same body, confirm top_contributions returns a sensible ranked list (SINR/BLER/PRB features should dominate, not hour_of_day).
+POST /predict/congestion?horizon=1h — needs a longer window (up to 336 hourly rows) for full accuracy, but will run with fewer (NaN-tolerant).
+POST /predict/anomaly — needs 1-3 recent values for one metric.
+If any of these 404s or 422s, check the request body against api/schemas.py's exact field names first — that's the most common mismatch.
+
+Phase 7 — Commit and deploy
+git add artifacts/ simulator/ ml_pipeline/ api/ scripts/ requirements.txt render.yaml .gitignore README.md
+git commit -m "Full pipeline + FastAPI serving layer"
+Push to GitHub, connect the repo to Render, confirm render.yaml's startCommand matches api.main:app. Render will run pip install -r requirements.txt then start uvicorn — it never touches simulator/ or scripts/, only loads artifacts/ at boot, per Phase 6.
+
+Order-of-operations summary (the short version, once everything above is in place)
+1. simulator/topology.py        -> test with Phase 1 smoke test
+2. simulator/capacity.py        -> audit_capacity_chain on Phase 1 output
+3. simulator/operational.py     -> generate 90 days, audit_fault_magnitude
+4. ml_pipeline/*.py              -> build feature tables, sanity-check NaNs
+5. scripts/run_full_pipeline.py -> python -m scripts.run_full_pipeline (writes artifacts/)
+6. api/*.py                      -> uvicorn api.main:app --reload, test via /docs
+7. git commit artifacts/ + code -> push -> Render deploy
+If something breaks, the failing phase tells you where to look — this is exactly why each phase has its own isolated test above, rather than one big end-to-end run with no checkpoints.

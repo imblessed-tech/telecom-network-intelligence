@@ -1,0 +1,74 @@
+{
+  "numeric_features": [
+    "prb_util_t",
+    "traffic_t",
+    "capacity_headroom_current",
+    "prb_lag_1h",
+    "prb_lag_2h",
+    "prb_lag_24h",
+    "prb_lag_168h",
+    "traffic_lag_1h",
+    "traffic_lag_24h",
+    "prb_mean_24h",
+    "prb_std_24h",
+    "prb_mean_7d",
+    "prb_slope_7d",
+    "traffic_mean_24h",
+    "traffic_slope_7d",
+    "hour_of_day",
+    "day_of_week",
+    "is_weekend",
+    "cell_capacity_mbps"
+  ],
+  "categorical_features": [
+    "technology",
+    "region_name",
+    "site_type"
+  ],
+  "categories": {
+    "technology": [
+      "4G",
+      "5G"
+    ],
+    "region_name": [
+      "East",
+      "Lagos",
+      "North",
+      "South",
+      "West"
+    ],
+    "site_type": [
+      "rural",
+      "suburban",
+      "urban"
+    ]
+  },
+  "encoded_feature_order": [
+    "prb_util_t",
+    "traffic_t",
+    "capacity_headroom_current",
+    "prb_lag_1h",
+    "prb_lag_2h",
+    "prb_lag_24h",
+    "prb_lag_168h",
+    "traffic_lag_1h",
+    "traffic_lag_24h",
+    "prb_mean_24h",
+    "prb_std_24h",
+    "prb_mean_7d",
+    "prb_slope_7d",
+    "traffic_mean_24h",
+    "traffic_slope_7d",
+    "hour_of_day",
+    "day_of_week",
+    "is_weekend",
+    "cell_capacity_mbps",
+    "technology_5G",
+    "region_name_Lagos",
+    "region_name_North",
+    "region_name_South",
+    "region_name_West",
+    "site_type_suburban",
+    "site_type_urban"
+  ]
+}

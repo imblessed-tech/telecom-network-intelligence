@@ -1,0 +1,122 @@
+{
+  "name": "mesh_fault",
+  "rows": 43200,
+  "positive_hours": 45,
+  "fault_events": 6,
+  "variants": {
+    "full": {
+      "features": [
+        "utilization_mean",
+        "utilization_max",
+        "util_lag_1h",
+        "util_mean_4h",
+        "util_max_4h",
+        "util_change_1h",
+        "latency_mean_ms",
+        "jitter_mean_ms",
+        "packet_loss_mean_pct",
+        "availability_mean",
+        "latency_mean_4h",
+        "jitter_mean_4h",
+        "packet_loss_mean_4h"
+      ],
+      "constant_features": [
+        "utilization_mean",
+        "utilization_max",
+        "util_lag_1h",
+        "util_mean_4h",
+        "util_max_4h",
+        "util_change_1h"
+      ],
+      "folds": [
+        {
+          "fold": 0,
+          "test_positive_hours": 32,
+          "prauc": 0.9688425925925925,
+          "base_rate": 0.002962962962962963,
+          "lift": 326.984375
+        },
+        {
+          "fold": 1,
+          "test_positive_hours": 3,
+          "prauc": 1.0,
+          "base_rate": 0.0002777777777777778,
+          "lift": 3600.0
+        },
+        {
+          "fold": 2,
+          "test_positive_hours": 5,
+          "prauc": 1.0,
+          "base_rate": 0.000462962962962963,
+          "lift": 2160.0
+        },
+        {
+          "fold": 3,
+          "test_positive_hours": 5,
+          "prauc": 1.0,
+          "base_rate": 0.000462962962962963,
+          "lift": 2160.0
+        }
+      ],
+      "valid_folds": 4,
+      "mean_prauc": 0.9922106481481481,
+      "mean_lift": 2061.74609375
+    },
+    "sanitized": {
+      "features": [
+        "utilization_mean",
+        "utilization_max",
+        "util_lag_1h",
+        "util_mean_4h",
+        "util_max_4h",
+        "util_change_1h"
+      ],
+      "constant_features": [
+        "utilization_mean",
+        "utilization_max",
+        "util_lag_1h",
+        "util_mean_4h",
+        "util_max_4h",
+        "util_change_1h"
+      ],
+      "folds": [
+        {
+          "fold": 0,
+          "test_positive_hours": 32,
+          "prauc": 0.002962962962962963,
+          "base_rate": 0.002962962962962963,
+          "lift": 1.0
+        },
+        {
+          "fold": 1,
+          "test_positive_hours": 3,
+          "prauc": 0.0002777777777777778,
+          "base_rate": 0.0002777777777777778,
+          "lift": 1.0
+        },
+        {
+          "fold": 2,
+          "test_positive_hours": 5,
+          "prauc": 0.000462962962962963,
+          "base_rate": 0.000462962962962963,
+          "lift": 1.0
+        },
+        {
+          "fold": 3,
+          "test_positive_hours": 5,
+          "prauc": 0.000462962962962963,
+          "base_rate": 0.000462962962962963,
+          "lift": 1.0
+        }
+      ],
+      "valid_folds": 4,
+      "mean_prauc": 0.0010416666666666667,
+      "mean_lift": 1.0
+    }
+  },
+  "warnings": [
+    "sanitized: every feature is constant \u2014 no behavioral signal exists.",
+    "full-feature score reflects deterministic fault-effect formulas in the simulator (upper bound / sanity check), not generalizable learning."
+  ],
+  "deployable": false
+}

@@ -1,0 +1,83 @@
+{
+  "name": "core_fault",
+  "modeled": false,
+  "fault_events": 10,
+  "positive_hours": 44,
+  "reason": "10 fault episodes < 15: no held-out evaluation is statistically meaningful. Descriptive separation only.",
+  "separation_behavioral": [
+    {
+      "feature": "cpu_max_pct",
+      "healthy_mean": 33.44744328746746,
+      "faulty_mean": 42.89090909090908,
+      "cohens_d": 1.4760133987387776
+    },
+    {
+      "feature": "cpu_mean_pct",
+      "healthy_mean": 30.176838508739305,
+      "faulty_mean": 38.24261363636364,
+      "cohens_d": 1.3112857562016558
+    },
+    {
+      "feature": "memory_max_pct",
+      "healthy_mean": 37.49545370026032,
+      "faulty_mean": 45.059090909090905,
+      "cohens_d": 1.283834838982576
+    },
+    {
+      "feature": "cpu_mean_4h",
+      "healthy_mean": 30.18063096566258,
+      "faulty_mean": 36.246874999999996,
+      "cohens_d": 1.1890694974790077
+    },
+    {
+      "feature": "cpu_lag_1h",
+      "healthy_mean": 30.182013301088272,
+      "faulty_mean": 37.47159090909091,
+      "cohens_d": 1.1842375755154597
+    },
+    {
+      "feature": "memory_mean_pct",
+      "healthy_mean": 34.28452491632577,
+      "faulty_mean": 40.89204545454545,
+      "cohens_d": 1.1737143137064658
+    },
+    {
+      "feature": "cpu_std_4h",
+      "healthy_mean": 3.604591135063343,
+      "faulty_mean": 5.551334247033694,
+      "cohens_d": 1.144685925096326
+    },
+    {
+      "feature": "memory_mean_4h",
+      "healthy_mean": 34.28644322548655,
+      "faulty_mean": 39.33238636363637,
+      "cohens_d": 1.084257069510008
+    },
+    {
+      "feature": "cpu_change_1h",
+      "healthy_mean": -0.0011185006045949183,
+      "faulty_mean": 0.7710227272727272,
+      "cohens_d": 0.20401667414836797
+    }
+  ],
+  "separation_proxy_features": [
+    {
+      "feature": "availability_mean",
+      "healthy_mean": 100.0,
+      "faulty_mean": 70.68181818181819,
+      "cohens_d": -25.139906265910774
+    },
+    {
+      "feature": "session_failure_rate_mean",
+      "healthy_mean": 0.19999999999999998,
+      "faulty_mean": 2.032386363636364,
+      "cohens_d": 25.139905942554336
+    },
+    {
+      "feature": "session_failure_mean_4h",
+      "healthy_mean": 0.2020526334139085,
+      "faulty_mean": 1.5306107954545458,
+      "cohens_d": 17.18481230250729
+    }
+  ]
+}

@@ -1,0 +1,87 @@
+{
+  "numeric_features": [
+    "sinr_mean",
+    "bler_mean",
+    "drop_rate_mean",
+    "prb_util_mean",
+    "handover_success_mean",
+    "sinr_lag_1h",
+    "bler_lag_1h",
+    "drop_rate_lag_1h",
+    "prb_lag_1h",
+    "prb_lag_4h",
+    "prb_mean_4h",
+    "prb_std_4h",
+    "sinr_mean_4h",
+    "sinr_slope_4h",
+    "bler_mean_4h",
+    "drop_rate_mean_4h",
+    "prb_change_1h",
+    "sinr_change_4h",
+    "bler_change_4h",
+    "alarm_count_trailing_24h",
+    "hours_since_last_alarm",
+    "hour_of_day",
+    "day_of_week",
+    "is_weekend",
+    "cell_capacity_mbps"
+  ],
+  "categorical_features": [
+    "technology",
+    "band",
+    "site_type"
+  ],
+  "categories": {
+    "technology": [
+      "4G",
+      "5G"
+    ],
+    "band": [
+      "1800MHz",
+      "2100MHz",
+      "2600MHz",
+      "3500MHz",
+      "700MHz"
+    ],
+    "site_type": [
+      "rural",
+      "suburban",
+      "urban"
+    ]
+  },
+  "encoded_feature_order": [
+    "sinr_mean",
+    "bler_mean",
+    "drop_rate_mean",
+    "prb_util_mean",
+    "handover_success_mean",
+    "sinr_lag_1h",
+    "bler_lag_1h",
+    "drop_rate_lag_1h",
+    "prb_lag_1h",
+    "prb_lag_4h",
+    "prb_mean_4h",
+    "prb_std_4h",
+    "sinr_mean_4h",
+    "sinr_slope_4h",
+    "bler_mean_4h",
+    "drop_rate_mean_4h",
+    "prb_change_1h",
+    "sinr_change_4h",
+    "bler_change_4h",
+    "alarm_count_trailing_24h",
+    "hours_since_last_alarm",
+    "hour_of_day",
+    "day_of_week",
+    "is_weekend",
+    "cell_capacity_mbps",
+    "technology_5G",
+    "band_2100MHz",
+    "band_2600MHz",
+    "band_3500MHz",
+    "band_700MHz",
+    "site_type_suburban",
+    "site_type_urban"
+  ],
+  "decision_threshold": 0.08136273175477982
+}
