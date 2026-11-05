@@ -197,6 +197,7 @@ BigQuery data marts and Looker Studio report covering network health, RAN metric
 
 Configured for deployment on [Render](https://render.com) using standard web service specifications in `render.yaml`. The service loads serialized artifacts from `artifacts/` at boot and serves inference requests via FastAPI.
 
+See open API docs: https://telecom-network-intelligence-api.onrender.com/docs
 ---
 
 ## Technology Stack
