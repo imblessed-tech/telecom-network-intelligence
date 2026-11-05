@@ -1,20 +1,20 @@
 # Telecom Network Intelligence
 
-A synthetic telecom network — topology, 90 days of operational telemetry, and a served machine learning layer — built to demonstrate end-to-end network analytics engineering: from causal data generation through feature engineering, model validation, and production API deployment.
+A synthetic telecom network covering topology, 90 days of operational telemetry, and a served machine learning layer. Built to demonstrate end-to-end network analytics engineering from causal data generation through feature engineering, model validation, and production API deployment.
 
-> **This is not real operator data.** The network topology, subscriber demand, and fault events are fully synthetic, generated to be structurally and statistically plausible (modeled loosely on the scale and geography of a large Nigerian mobile operator) without claiming to represent any real operator's infrastructure or performance.
-
----
-
-## Why this project exists
-
-Telecom operators run Network Operations Centers (NOCs) that need to answer three questions continuously: *is something about to break, is the network under pressure, and is this behavior actually unusual?* Real telemetry for building and validating this kind of tooling is proprietary and rarely available for public portfolio work. This project builds a network from first principles — with enough structural realism that the resulting analytics and ML problems are genuine, not manufactured — to demonstrate the full pipeline a telecom data/ML engineer would own in practice.
-
-The build deliberately follows one rule throughout: **the simulator generates evidence, never answers.** No table says `fault = True` directly; instead, a fault changes upstream conditions (utilization, radio quality, link state), and those changes propagate through the network's real topology into observable telemetry. Every downstream model has to infer what happened from the same evidence a NOC engineer would have — the same discipline that keeps this from being a toy dataset with pre-baked labels.
+> **Note on data:** The network topology, subscriber demand, and fault events are synthetic, generated to be structurally and statistically plausible (modeled loosely on the scale and geography of a large Nigerian mobile operator) without claiming to represent any real operator's infrastructure or performance.
 
 ---
 
-## What's in the network
+## Project Motivation
+
+Telecom operators run Network Operations Centers (NOCs) that need to answer three questions continuously: *is something about to break, is the network under pressure, and is this behavior actually unusual?* Real telemetry for building and validating this kind of tooling is proprietary and rarely available for public portfolio work. This project builds a network from first principles with enough structural realism that the resulting analytics and ML problems are genuine, not manufactured, to demonstrate the full pipeline a telecom data/ML engineer would own in practice.
+
+The build follows one rule throughout: **the simulator generates evidence, never answers.** No table says `fault = True` directly; instead, a fault changes upstream conditions (utilization, radio quality, link state), and those changes propagate through the network's real topology into observable telemetry. Every downstream model infers what happened from the same evidence a NOC engineer would have, keeping this from being a toy dataset with pre-baked labels.
+
+---
+
+## Network Architecture & Scale
 
 | Layer | Scale |
 |---|---|
@@ -26,63 +26,57 @@ The build deliberately follows one rule throughout: **the simulator generates ev
 | Core nodes | 5 (pooled primary/secondary dependency) |
 | Telemetry window | 90 days at 15-minute resolution |
 
-The topology isn't arbitrary: aggregation clustering runs k-means-constrained on real geographic coordinates, transport redundancy is built via a minimum spanning tree (Kruskal's algorithm) augmented with shortest-path failover routing, and every layer's capacity is sized bottom-up from the actual traffic it carries rather than assigned independently — so utilization, congestion, and cascading failure are structural properties of the network, not scripted outcomes.
+The topology is not arbitrary: aggregation clustering runs k-means-constrained on real geographic coordinates, transport redundancy is built via a minimum spanning tree (Kruskal's algorithm) augmented with shortest-path failover routing, and every layer's capacity is sized bottom-up from the actual traffic it carries rather than assigned independently. Utilization, congestion, and cascading failure are structural properties of the network, not scripted outcomes.
 
 ---
 
-## Use cases
+## Use Cases
 
 | Use case | Status | Notes |
 |---|---|---|
-| **Concurrent fault detection** (cell-level) | Deployed | XGBoost + SHAP, served via API |
-| **Congestion forecasting** (1h / 6h / 24h) | Deployed | Beats seasonal-naive baseline by 74–96% MAE |
-| **Anomaly detection** | Deployed | Seasonal baseline + z-score, hidden-truth evaluation against three distinct phenomena (fault / congestion / anomaly) |
-| Mesh & core fault detection | Investigated, not deployed | See *Known limitations* — the honest result mattered more than a padded metric |
-| Root-cause analysis | Planned | Natural extension once fault detection is live — rank candidate root-cause entities using the topology's dependency graph |
-| Alarm prioritization | Possible extension | Classifier over alarm stream + telemetry context |
+| **Concurrent fault detection** (cell-level) | Deployed | XGBoost + SHAP; 32x lift over base rate on a 0.5%-positive dataset, served via API |
+| **Congestion forecasting** (1h / 6h / 24h) | Deployed | Beats seasonal-naive baseline by 74 to 96% MAE |
+| **Anomaly detection** | Deployed | Seasonal baseline + z-score, evaluated against three distinct phenomena (fault / congestion / anomaly) |
 
 ---
 
-## Architecture
+## System Structure
 
 ```
 simulator/            topology + capacity + 90-day telemetry generation
-ml_pipeline/           feature engineering + model training (shared by
-                        training and live inference — one implementation,
-                        not two that can drift apart)
-artifacts/              trained models, SHAP explainers, feature schemas
-api/                    FastAPI serving layer (stateless — loads artifacts/
-                        at startup, never touches the simulator)
-scripts/                single-command pipeline runner
-notebooks/              exploratory + analytics-layer notebook (BigQuery / Looker)
+ml_pipeline/          feature engineering + model training (shared by
+                      training and live inference to prevent skew)
+artifacts/            trained models, SHAP explainers, feature schemas
+api/                  FastAPI serving layer (stateless, loads artifacts/
+                      at startup, never touches the simulator)
+scripts/              single-command pipeline runner and results audits
+notebooks/            exploratory + analytics-layer notebook (BigQuery / Looker)
 ```
 
-The data-generation pipeline and the serving API are two independent lifecycles that meet at exactly one point — the `artifacts/` directory. The API never regenerates data or retrains anything; it loads what's already there. This mirrors how a real ML system separates offline training from online serving.
+The data-generation pipeline and the serving API are two independent lifecycles that meet at one point: the `artifacts/` directory. The API never regenerates data or retrains anything; it loads what is already there. This mirrors how a real ML system separates offline training from online serving.
 
 ---
 
-## Skills demonstrated
+## Technical Scope
 
-- **Network engineering / graph algorithms** — Kruskal MST for transport redundancy, shortest-path failover routing (NetworkX), haversine-based geographic distance, capacity-constrained clustering
-- **Causal synthetic data design** — multi-layer capacity chains (cell → backhaul → aggregation → core), topology-driven fault propagation, deliberate separation of fault / congestion / anomaly as distinct, non-overlapping phenomena
-- **Time-series feature engineering** — trailing rolling statistics, lag features, linear-trend slopes, seasonal baselines, strict temporal leakage discipline (train/val/test split with window-aware gaps)
-- **ML validation rigor** — precision-recall analysis under severe class imbalance, blocked time-series cross-validation, SHAP-based feature attribution, and — deliberately — *declining* to deploy a model when the validation evidence didn't support it (see below)
-- **Production ML serving** — FastAPI, Pydantic schema validation, stateless feature computation shared between training and inference, versioned model artifacts
-- **Analytics engineering** — BigQuery data marts, Looker Studio dashboards, SQL view design
-
----
-
-## Known limitations & design decisions
-
-Documented deliberately, because the investigation behind them is part of the work:
-
-- **4-hour-ahead fault *prediction* was tested and found infeasible with this generator's design** — fault onset is exogenous (independent of prior entity telemetry), so there is no learnable precursor signal. The project pivoted to **concurrent detection** (is a fault active *right now*, from telemetry alone) instead of forecasting one — a real and useful distinction, confirmed by testing detection PR-AUC (~0.7–0.8 in the sanitized feature study) against forecasting PR-AUC (~0.002, statistically indistinguishable from random).
-- **Mesh and core fault detection were evaluated and not deployed.** Mesh link telemetry carries zero baseline traffic outside failover events in the current simulator, so sanitized (non-tautological) features have no variance to learn from. Core faults number too few (~3 events) to support any statistically meaningful held-out evaluation. Both are documented as generator-design findings rather than forced into a misleading live endpoint.
-- **The live cell fault detector currently uses RAN-layer telemetry only** (no cross-layer backhaul/core context), to keep the API stateless. This measurably underperforms the cross-layer-enriched version validated during development. Extending the live feature set to include current backhaul/core-uplink utilization is the highest-value next step before this model should be trusted operationally.
+- **Network engineering and graph algorithms:** Kruskal MST for transport redundancy, shortest-path failover routing (NetworkX), haversine-based geographic distance, capacity-constrained clustering
+- **Causal synthetic data design:** multi-layer capacity chains (cell to backhaul to aggregation to core), topology-driven fault propagation, deliberate separation of fault, congestion, and anomaly as distinct, non-overlapping phenomena
+- **Time-series feature engineering:** trailing rolling statistics, lag features, linear-trend slopes, seasonal baselines, strict temporal leakage discipline (train/val/test split with window-aware gaps)
+- **ML validation rigor:** precision-recall analysis under severe class imbalance, blocked time-series cross-validation, SHAP-based feature attribution, and declining to deploy a model when the validation evidence did not support it
+- **Production ML serving:** FastAPI, Pydantic schema validation, stateless feature computation shared between training and inference, versioned model artifacts
+- **Analytics engineering:** BigQuery data marts, Looker Studio dashboards, SQL view design
 
 ---
 
-## Running it
+## Design Decisions & Validation Findings
+
+- **Concurrent detection over future prediction:** 4-hour-ahead fault forecasting was tested and found infeasible because fault onset is exogenous (no learnable precursor signal exists in prior telemetry). PR-AUC landed at ~0.002, statistically indistinguishable from random. The project pivoted to concurrent detection (identifying active faults right now) where the signal is real: faulted cells show Cohen's d > 1.6 on drop rate and alarm features, and the deployed model achieves 32x lift over base rate on a severely class-imbalanced dataset (0.5% positive hours).
+- **Exclusion of mesh and core fault detectors:** Mesh link telemetry carries zero baseline traffic outside failover events, so sanitized features have no variance to learn from. Core faults number too few to support any held-out evaluation. The investigation is documented in the reports rather than forced into a misleading endpoint.
+- **Stateless serving design:** The live cell fault detector uses RAN-layer telemetry only to keep the API stateless. The cross-layer-enriched version (including backhaul and core-uplink context) measurably outperforms it in offline validation. Extending the live feature set to accept current backhaul context is the direct next iteration for operational use.
+
+---
+
+## Running Locally
 
 ### 1. Setup
 
@@ -92,13 +86,13 @@ source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2. Generate the network and train models (run once)
+### 2. Generate the network and train models (optional checkpointed run)
 
 ```bash
 python scripts/run_full_pipeline.py
 ```
 
-This generates the static topology, 90 days of telemetry, builds ML feature tables, and trains/evaluates every model, writing results to `artifacts/`. Each stage checkpoints to `data/` and is skipped on rerun unless `--force` is passed.
+This generates the static topology, 90 days of telemetry, builds ML feature tables, and trains every model, writing results to `artifacts/`. Each stage checkpoints to `data/` and is skipped on rerun unless `--force` is passed.
 
 ```bash
 python scripts/run_full_pipeline.py --stop-after topology   # inspect just the network
@@ -111,19 +105,19 @@ python scripts/run_full_pipeline.py --force                 # full regeneration
 uvicorn api.main:app --reload
 ```
 
-Interactive docs at `http://127.0.0.1:8000/docs`.
+Interactive OpenAPI docs will be available at `http://127.0.0.1:8000/docs`.
 
 ---
 
-## API reference
+## API Reference
 
 ### `GET /health`
 
-Confirms every artifact loaded successfully at startup.
+Confirms all serialized artifacts loaded successfully into memory at startup.
 
 ### `POST /predict/fault/cell`
 
-Detects whether a cell is currently experiencing a fault, from its recent telemetry window.
+Detects whether a cell is currently experiencing an active fault from its recent telemetry window.
 
 ```json
 {
@@ -148,9 +142,11 @@ Detects whether a cell is currently experiencing a fault, from its recent teleme
 
 ### `POST /predict/fault/cell/explain`
 
-Same request body — returns the SHAP-ranked feature contributions behind that single prediction, for audit/explainability.
+Accepts the same request body and returns the SHAP feature contributions explaining the prediction.
 
-### `POST /predict/congestion?horizon=1h` *(also `6h`, `24h`)*
+### `POST /predict/congestion?horizon=1h` (also `6h`, `24h`)
+
+Forecasts future resource utilization and capacity headroom across designated time horizons.
 
 ```json
 {
@@ -172,9 +168,9 @@ Same request body — returns the SHAP-ranked feature contributions behind that 
 }
 ```
 
-*(Accuracy improves substantially with a longer window — up to 336 hourly rows / 14 days — since the model uses weekly-seasonal lag features.)*
-
 ### `POST /predict/anomaly`
+
+Scores recent values against the precomputed seasonal baseline lookup table.
 
 ```json
 {
@@ -189,22 +185,21 @@ Same request body — returns the SHAP-ranked feature contributions behind that 
 
 ---
 
-## Analytics dashboard
+## Analytics Dashboard
 
-A BigQuery-backed Looker Studio report covering network overview, RAN performance, capacity/congestion, transport & core health, alarms, and regional/topology analysis:
+BigQuery data marts and Looker Studio report covering network health, RAN metrics, capacity headroom, and regional distribution:
 
-**[Looker Studio report →](https://datastudio.google.com/reporting/6e9a6d18-6c9d-494f-adba-21f3db47ef4a)**
-
-*https://datastudio.google.com/reporting/6e9a6d18-6c9d-494f-adba-21f3db47ef4a*
+[Looker Studio Dashboard](https://datastudio.google.com/reporting/6e9a6d18-6c9d-494f-adba-21f3db47ef4a)
 
 ---
 
-## Deployment
+## Deployment Configuration
 
-Deployed on [Render](https://render.com) as a standard Python web service. See `render.yaml`. The service only depends on `artifacts/` and `api/` — the simulator and training code never run in production.
+Configured for deployment on [Render](https://render.com) using standard web service specifications in `render.yaml`. The service loads serialized artifacts from `artifacts/` at boot and serves inference requests via FastAPI.
 
 ---
 
-## Tech stack
+## Technology Stack
 
-Python · pandas · NumPy · SciPy · NetworkX · scikit-learn · XGBoost · SHAP · FastAPI · Pydantic · Google BigQuery · Looker Studio · Render
+Python, pandas, NumPy, SciPy, NetworkX, scikit-learn, XGBoost, SHAP, FastAPI, Pydantic, Google BigQuery, Looker Studio, Render
+
